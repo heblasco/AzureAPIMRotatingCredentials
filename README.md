@@ -17,7 +17,7 @@ Inspired by cmendible's gist
 | --- | --- |
 | `Get-ApimCredentials.ps1` | Read-only discovery. Writes a JSON inventory of affected items. |
 | `Invoke-ApimCredentialRotation.ps1` | Rotates the auto-rotatable items in the inventory. Dry-run by default. |
-| `ApimCredentials.Common.psm1` | Shared helpers (az CLI wrapper, ARM calls, paging, private temp files, feedback). |
+| `ApimCredentials.Common.psm1` | Shared helpers (ARM HTTP client, token, paging, parallel GETs, feedback). |
 
 ## Requirements
 
@@ -26,8 +26,18 @@ Inspired by cmendible's gist
 - Permissions on the APIM instance: Reader for discovery; API Management Service Contributor
   (or equivalent) for rotation. `-Verify` also needs the `listSecrets` / `listKeys` / `listValue` actions.
 
-No `jq` is needed. On Windows the module calls the Azure CLI Python entry point directly to avoid
-`az.cmd` argument-quoting problems with URLs that contain `&`.
+## How it works (performance)
+
+The Azure CLI is used only to read the signed-in account and obtain an ARM access token
+(`az account get-access-token`). Every ARM call is then sent directly from PowerShell through a
+single reused `HttpClient`, and read-only GETs (collections, operations, policies) run concurrently.
+Each call takes milliseconds instead of the seconds needed to start an `az rest` process, so a
+discovery that took minutes now finishes in seconds. The token is refreshed automatically and is never
+written or printed. Transient errors (429, 5xx) are retried for reads only, honouring `Retry-After`;
+mutations are never retried.
+
+Use `-ThrottleLimit` (default 16) on `Get-ApimCredentials.ps1` to change the number of concurrent
+requests, for example lower it if ARM starts throttling.
 
 ## 1. Discover affected credentials
 
@@ -38,6 +48,9 @@ No `jq` is needed. On Windows the module calls the Azure CLI Python entry point 
 # Every APIM in a subscription / in every subscription you can see
 ./Get-ApimCredentials.ps1 -SubscriptionId <subscription-id>
 ./Get-ApimCredentials.ps1 -AllSubscriptions -OutFile all.json
+
+# Faster: skip per-operation policies (coverage is then reported as incomplete)
+./Get-ApimCredentials.ps1 -ResourceGroup my-rg -Name my-apim -SkipOperationPolicies
 ```
 
 Output: `apim-credentials-inventory.json`
@@ -96,7 +109,7 @@ and rule names, never policy content.
 
 New values for `named-value-secret` items are read from the environment variable
 `APIM_NV_<ID>` (upper case, non-alphanumeric characters replaced by `_`) or prompted securely.
-They are sent to Azure through a private temp file that is wiped and deleted afterwards.
+They are sent to ARM directly from memory over TLS; nothing is written to disk.
 
 ### Outputs
 

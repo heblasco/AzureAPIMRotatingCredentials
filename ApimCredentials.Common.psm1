@@ -1,34 +1,20 @@
 #Requires -Version 7.2
 # Shared helpers for Get-ApimCredentials.ps1 and Invoke-ApimCredentialRotation.ps1.
-# Secret-safety rules: raw ARM responses, stderr and exception messages are never persisted or printed;
-# callers project an explicit allow-list of non-secret fields into their output.
+# Secret-safety rules: raw ARM responses, stderr, tokens and exception messages are never persisted or
+# printed; callers project an explicit allow-list of non-secret fields into their output.
+#
+# Performance: Azure CLI is used only to read the signed-in account and obtain an ARM access token.
+# All ARM calls go through one reused HttpClient (connection pooling, ~100-300 ms per call instead of
+# ~3-5 s per 'az rest' process), and read-only GETs can be issued concurrently (Invoke-ArmParallel).
 
 Set-StrictMode -Version Latest
 
 $script:ApiVersion = '2024-05-01'
-$script:AzExe = $null
-$script:AzPrefix = @()
-
-function Initialize-AzCli {
-    $cmd = Get-Command az -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $cmd) { throw 'Azure CLI (az) not found in PATH.' }
-    $script:AzExe = $cmd.Source
-    $script:AzPrefix = @()
-    # On Windows az is az.cmd: cmd.exe mangles '&', '(' and ')' in arguments (URLs with several query
-    # parameters, nextLink pagination). Call the bundled Python directly to bypass cmd.exe.
-    if ($cmd.Source -like '*.cmd') {
-        $py = Join-Path (Split-Path $cmd.Source) '..\python.exe'
-        if (Test-Path $py) {
-            $script:AzExe = (Resolve-Path $py).Path
-            $script:AzPrefix = @('-IBm', 'azure.cli')
-        }
-    }
-    $env:PYTHONIOENCODING = 'utf-8'
-    $env:AZURE_CORE_ONLY_SHOW_ERRORS = 'true'
-    $r = Invoke-AzCli -Arguments @('account', 'show', '-o', 'json')
-    if ($r.ExitCode -ne 0) { throw 'Not logged in to Azure CLI. Run: az login' }
-    return ($r.Stdout | ConvertFrom-Json)
-}
+$script:ArmResource = 'https://management.azure.com/'
+$script:Token = $null
+$script:TokenExpiresUtc = [datetime]::MinValue
+$script:Http = $null
+$script:TransientStatus = @(408, 422, 429, 500, 502, 503, 504)
 
 function Get-SanitizedAzError {
     param([string]$Text)
@@ -42,7 +28,7 @@ function Get-SanitizedAzError {
 
 function Invoke-AzCli {
     param([Parameter(Mandatory)][string[]]$Arguments)
-    $all = & $script:AzExe @script:AzPrefix @Arguments '--only-show-errors' 2>&1
+    $all = & az @Arguments '--only-show-errors' 2>&1
     $exit = $LASTEXITCODE
     $out = ($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
     $err = ($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join "`n"
@@ -51,6 +37,36 @@ function Invoke-AzCli {
         Stdout   = $out
         Error    = if ($exit -ne 0) { Get-SanitizedAzError $err } else { $null }
     }
+}
+
+# Obtains (or refreshes, 5 minutes before expiry) the ARM token from the Azure CLI login. Never output.
+function Get-ArmToken {
+    if ($script:Token -and (Get-Date).ToUniversalTime() -lt $script:TokenExpiresUtc.AddMinutes(-5)) { return $script:Token }
+    $r = Invoke-AzCli -Arguments @('account', 'get-access-token', '--resource', $script:ArmResource, '-o', 'json')
+    if ($r.ExitCode -ne 0) { throw "Could not obtain an ARM access token from Azure CLI ($($r.Error)). Run: az login" }
+    $t = $r.Stdout | ConvertFrom-Json
+    $script:Token = $t.accessToken
+    $script:TokenExpiresUtc = if ($t.PSObject.Properties['expires_on'] -and $t.expires_on) {
+        [DateTimeOffset]::FromUnixTimeSeconds([long]$t.expires_on).UtcDateTime
+    }
+    else { ([datetime]$t.expiresOn).ToUniversalTime() }
+    return $script:Token
+}
+
+function Initialize-AzCli {
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI (az) not found in PATH.' }
+    $env:AZURE_CORE_ONLY_SHOW_ERRORS = 'true'
+    $r = Invoke-AzCli -Arguments @('account', 'show', '-o', 'json')
+    if ($r.ExitCode -ne 0) { throw 'Not logged in to Azure CLI. Run: az login' }
+    if (-not $script:Http) {
+        $handler = [System.Net.Http.SocketsHttpHandler]::new()
+        $handler.MaxConnectionsPerServer = 32
+        $handler.PooledConnectionLifetime = [TimeSpan]::FromMinutes(5)
+        $script:Http = [System.Net.Http.HttpClient]::new($handler)
+        $script:Http.Timeout = [TimeSpan]::FromSeconds(120)
+    }
+    [void](Get-ArmToken)
+    return ($r.Stdout | ConvertFrom-Json)
 }
 
 function Get-ApimBaseUrl {
@@ -65,82 +81,124 @@ function Add-ApiVersion {
     "$Url${sep}api-version=$script:ApiVersion"
 }
 
-# Returns @{ Ok; Data; Error; NotFound }. Data is the parsed JSON (or $null for empty 2xx bodies such as 204).
+function New-ArmRequest {
+    param([string]$Method, [string]$Url, $Body, [string[]]$Headers)
+    $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::new($Method.ToUpperInvariant()), (Add-ApiVersion $Url))
+    $req.Headers.Authorization = [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', (Get-ArmToken))
+    foreach ($h in @($Headers | Where-Object { $_ })) {
+        $k, $v = $h -split '=', 2
+        [void]$req.Headers.TryAddWithoutValidation($k.Trim(), $v)
+    }
+    if ($null -ne $Body) {
+        $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
+        $req.Content = [System.Net.Http.StringContent]::new($json, [Text.Encoding]::UTF8, 'application/json')
+    }
+    elseif ($Method -ne 'get') {
+        $req.Content = [System.Net.Http.StringContent]::new('', [Text.Encoding]::UTF8, 'application/json')
+    }
+    return $req
+}
+
+# Turns an HttpResponseMessage (or a failed task) into @{ Ok; Data; Error; NotFound; StatusCode; Transient; RetryAfter; Headers }.
+# Error is "<Reason>: <ARM error code>" only; response bodies are never surfaced.
+function ConvertFrom-ArmResponse {
+    param([System.Threading.Tasks.Task]$Task)
+    $resp = $null
+    try { $resp = $Task.GetAwaiter().GetResult() }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Data = $null; Error = 'NetworkError'; NotFound = $false; StatusCode = 0; Transient = $true; RetryAfter = $null; Headers = @{} }
+    }
+    try {
+        $code = [int]$resp.StatusCode
+        $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if ($text) { $text = $text.TrimStart([char]0xFEFF) }
+        $hdr = @{}
+        foreach ($n in 'Location', 'Azure-AsyncOperation', 'Retry-After', 'ETag') {
+            $vals = $null
+            if ($resp.Headers.TryGetValues($n, [ref]$vals)) { $hdr[$n] = @($vals)[0] }
+        }
+        $retryAfter = if ($hdr['Retry-After'] -match '^\d+$') { [int]$hdr['Retry-After'] } else { $null }
+        if ($resp.IsSuccessStatusCode) {
+            $data = $null
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                try { $data = $text | ConvertFrom-Json -Depth 64 }
+                catch { return [pscustomobject]@{ Ok = $false; Data = $null; Error = 'NonJsonResponse'; NotFound = $false; StatusCode = $code; Transient = $false; RetryAfter = $null; Headers = $hdr } }
+            }
+            return [pscustomobject]@{ Ok = $true; Data = $data; Error = $null; NotFound = $false; StatusCode = $code; Transient = $false; RetryAfter = $null; Headers = $hdr }
+        }
+        $reason = if ($resp.ReasonPhrase) { $resp.ReasonPhrase } else { [string]$resp.StatusCode }
+        $armCode = $null
+        if ($text -match '"code"\s*:\s*"([A-Za-z0-9\.\-_]{1,80})"') { $armCode = $Matches[1] }
+        [pscustomobject]@{
+            Ok = $false; Data = $null; Error = (@($reason, $armCode) | Where-Object { $_ }) -join ': '
+            NotFound = ($code -eq 404); StatusCode = $code; Transient = ($code -in $script:TransientStatus); RetryAfter = $retryAfter; Headers = $hdr
+        }
+    }
+    finally { $resp.Dispose() }
+}
+
+# Single ARM call. Transient failures are retried for GET only: a timed-out regenerate may already have
+# rotated the key, and retrying a mutation would rotate it again.
 function Invoke-Arm {
     param(
         [ValidateSet('get', 'post', 'patch', 'put', 'delete')][string]$Method = 'get',
         [Parameter(Mandatory)][string]$Url,
-        [string]$BodyFile,
+        $Body,
         [string[]]$Headers
     )
-    $a = @('rest', '--method', $Method, '--url', (Add-ApiVersion $Url), '-o', 'json')
-    if ($BodyFile) { $a += @('--body', "@$BodyFile") }
-    if ($Headers) { $a += '--headers'; $a += $Headers }
-    # Retry transient failures for reads only. Mutations are never retried: a timed-out regenerate may
-    # already have rotated the key, and retrying would rotate it again.
     $attempt = 0
     while ($true) {
-        $r = Invoke-AzCli -Arguments $a
-        $transient = $r.ExitCode -ne 0 -and $r.Error -match 'Unprocessable Entity|ManagementApiRequestFailed|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout'
-        if ($Method -ne 'get' -or -not $transient -or ++$attempt -ge 4) { break }
-        Start-Sleep -Seconds ([Math]::Pow(2, $attempt) * 3)
+        $req = New-ArmRequest -Method $Method -Url $Url -Body $Body -Headers $Headers
+        try { $r = ConvertFrom-ArmResponse $script:Http.SendAsync($req) } finally { $req.Dispose() }
+        if ($Method -ne 'get' -or -not $r.Transient -or ++$attempt -ge 5) { return $r }
+        Start-Sleep -Seconds $(if ($r.RetryAfter) { [Math]::Min($r.RetryAfter, 60) } else { [Math]::Pow(2, $attempt) * 2 })
     }
-    if ($r.ExitCode -ne 0) {
-        return [pscustomobject]@{ Ok = $false; Data = $null; Error = $r.Error; NotFound = ($r.Error -match 'Not Found|NotFound') }
-    }
-    $data = $null
-    if (-not [string]::IsNullOrWhiteSpace($r.Stdout)) {
-        try { $data = $r.Stdout | ConvertFrom-Json -Depth 64 }
-        catch { return [pscustomobject]@{ Ok = $false; Data = $null; Error = 'NonJsonResponse'; NotFound = $false } }
-    }
-    [pscustomobject]@{ Ok = $true; Data = $data; Error = $null; NotFound = $false }
 }
 
-# GET a collection following nextLink. Returns @{ Ok; Items; Error; NotFound }.
+# Concurrent read-only GETs (at most -ThrottleLimit in flight). Results keep the order of -Urls.
+# Transient failures are retried sequentially through Invoke-Arm.
+function Invoke-ArmParallel {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Urls, [int]$ThrottleLimit = 16)
+    $results = [object[]]::new($Urls.Count)
+    for ($i = 0; $i -lt $Urls.Count; $i += $ThrottleLimit) {
+        $last = [Math]::Min($i + $ThrottleLimit, $Urls.Count) - 1
+        $batch = foreach ($j in $i..$last) {
+            $req = New-ArmRequest -Method 'get' -Url $Urls[$j]
+            [pscustomobject]@{ Index = $j; Request = $req; Task = $script:Http.SendAsync($req) }
+        }
+        foreach ($b in @($batch)) {
+            try { $results[$b.Index] = ConvertFrom-ArmResponse $b.Task } finally { $b.Request.Dispose() }
+        }
+    }
+    for ($j = 0; $j -lt $results.Count; $j++) {
+        if (-not $results[$j].Ok -and $results[$j].Transient) { $results[$j] = Invoke-Arm -Url $Urls[$j] }
+    }
+    return , $results
+}
+
+# GET several collections concurrently, following nextLink. Returns one @{ Ok; Items; Error; NotFound } per URL.
+function Get-ArmCollections {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Urls, [int]$ThrottleLimit = 16)
+    $first = Invoke-ArmParallel -Urls $Urls -ThrottleLimit $ThrottleLimit
+    $out = [object[]]::new($Urls.Count)
+    for ($j = 0; $j -lt $Urls.Count; $j++) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        $r = $first[$j]; $guard = 0
+        while ($true) {
+            if (-not $r.Ok) { $out[$j] = [pscustomobject]@{ Ok = $false; Items = $items; Error = $r.Error; NotFound = $r.NotFound }; break }
+            if ($r.Data -and $r.Data.PSObject.Properties['value']) { foreach ($v in @($r.Data.value)) { $items.Add($v) } }
+            $next = if ($r.Data -and $r.Data.PSObject.Properties['nextLink']) { $r.Data.nextLink } else { $null }
+            if (-not $next) { $out[$j] = [pscustomobject]@{ Ok = $true; Items = $items; Error = $null; NotFound = $false }; break }
+            if (++$guard -gt 500) { $out[$j] = [pscustomobject]@{ Ok = $false; Items = $items; Error = 'PaginationLimit'; NotFound = $false }; break }
+            $r = Invoke-Arm -Url $next
+        }
+    }
+    return , $out
+}
+
 function Get-ArmCollection {
     param([Parameter(Mandatory)][string]$Url)
-    $items = [System.Collections.Generic.List[object]]::new()
-    $next = $Url
-    $guard = 0
-    while ($next) {
-        if (++$guard -gt 500) { return [pscustomobject]@{ Ok = $false; Items = $items; Error = 'PaginationLimit'; NotFound = $false } }
-        $r = Invoke-Arm -Url $next
-        if (-not $r.Ok) { return [pscustomobject]@{ Ok = $false; Items = $items; Error = $r.Error; NotFound = $r.NotFound } }
-        if ($r.Data -and $r.Data.PSObject.Properties['value']) { foreach ($v in @($r.Data.value)) { $items.Add($v) } }
-        $next = if ($r.Data -and $r.Data.PSObject.Properties['nextLink']) { $r.Data.nextLink } else { $null }
-    }
-    [pscustomobject]@{ Ok = $true; Items = $items; Error = $null; NotFound = $false }
-}
-
-# Creates an unpredictable temp file readable only by the current user BEFORE any content is written.
-function New-PrivateTempFile {
-    $path = Join-Path ([IO.Path]::GetTempPath()) ('apimcred-' + [guid]::NewGuid().ToString('N') + '.json')
-    $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    $fs.Dispose()
-    if ($IsWindows) {
-        $acl = Get-Acl -LiteralPath $path
-        $acl.SetAccessRuleProtection($true, $false)
-        foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
-        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($me, 'FullControl', 'Allow'))
-        Set-Acl -LiteralPath $path -AclObject $acl
-    }
-    else {
-        & chmod 600 $path
-    }
-    return $path
-}
-
-function Remove-PrivateTempFile {
-    param([string]$Path)
-    if ($Path -and (Test-Path -LiteralPath $Path)) {
-        try {
-            $len = (Get-Item -LiteralPath $Path).Length
-            if ($len -gt 0) { [IO.File]::WriteAllBytes($Path, [byte[]]::new($len)) }
-        }
-        catch { }
-        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    }
+    (Get-ArmCollections -Urls @($Url))[0]
 }
 
 function Get-StringSha256 {
@@ -187,4 +245,4 @@ function Get-RotationFeedback {
 }
 
 Export-ModuleMember -Function Initialize-AzCli, Invoke-AzCli, Invoke-Arm, Get-ArmCollection, Get-ApimBaseUrl,
-    Add-ApiVersion, New-PrivateTempFile, Remove-PrivateTempFile, Get-StringSha256, Get-RotationFeedback -Variable ApiVersion
+    Add-ApiVersion, Invoke-ArmParallel, Get-ArmCollections, Get-StringSha256, Get-RotationFeedback -Variable ApiVersion

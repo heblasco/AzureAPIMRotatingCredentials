@@ -29,12 +29,15 @@ param(
     [Parameter(ParameterSetName = 'Scoped')][string]$Name,
     [Parameter(ParameterSetName = 'All')][switch]$AllSubscriptions,
     [string]$OutFile = 'apim-credentials-inventory.json',
-    [switch]$SkipOperationPolicies
+    [switch]$SkipOperationPolicies,
+    # Maximum concurrent read-only ARM requests. Lower it if you hit ARM throttling (HTTP 429).
+    [ValidateRange(1, 64)][int]$ThrottleLimit = 16
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'ApimCredentials.Common.psm1') -Force
 
+$NotSupportedRx = 'Bad ?Request|Method ?Not ?Allowed|NotSupported'
 $SecretNameRx = '(?i)(pass(word|wd)?|pwd|secret|token|api[-_]?key|subscription[-_]?key|ocp-apim|connection[-_ ]?string|accountkey|sharedaccess|sas|credential|private[-_]?key|client[-_]?secret|authorization|auth|bearer|signature|\bkey\b|[-_]key$)'
 $PolicyKeywordRx = '(?i)(authorization|password|token|api[-_]?key|subscription-key|ocp-apim|connection.?string|secret|bearer|basic\s|accountkey|sharedaccess|sig=)'
 # Value shapes that look like a literal credential, regardless of the surrounding element.
@@ -168,16 +171,24 @@ function Invoke-InstanceDiscovery {
     $items = [System.Collections.Generic.List[object]]::new()
     $coverage = [System.Collections.Generic.List[object]]::new()
 
+    # Prefetch every top-level collection and single resource concurrently; sections below read the cache.
+    $topLevel = @('subscriptions', 'namedValues', 'backends', 'authorizationServers', 'openidConnectProviders', 'identityProviders',
+        'authorizationProviders', 'loggers', 'caches', 'certificates', 'gateways', 'products', 'apis', 'policyFragments?format=rawxml', 'workspaces')
+    $pre = @{}
+    $fetched = Get-ArmCollections -Urls @($topLevel | ForEach-Object { "$base/$_" }) -ThrottleLimit $ThrottleLimit
+    for ($i = 0; $i -lt $topLevel.Count; $i++) { $pre[$topLevel[$i]] = $fetched[$i] }
+    $singles = Invoke-ArmParallel -Urls @($base, "$base/tenant/access") -ThrottleLimit $ThrottleLimit
+
     $list = {
-        param([string]$Collection, [string]$RelUrl, [switch]$OptionalFeature)
-        $r = Get-ArmCollection -Url "$base/$RelUrl"
-        $status = if ($r.Ok) { 'ok' } elseif ($OptionalFeature -and ($r.NotFound -or $r.Error -match 'Bad Request|MethodNotAllowed|NotSupported')) { 'not-supported' } else { 'failed' }
+        param([string]$Collection, [string]$RelUrl, [switch]$OptionalFeature, $Result)
+        $r = if ($Result) { $Result } elseif ($pre.ContainsKey($RelUrl)) { $pre[$RelUrl] } else { Get-ArmCollection -Url "$base/$RelUrl" }
+        $status = if ($r.Ok) { 'ok' } elseif ($OptionalFeature -and ($r.NotFound -or $r.Error -match $NotSupportedRx)) { 'not-supported' } else { 'failed' }
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = $Collection; status = $status; count = $r.Items.Count; error = $r.Error })
         if ($status -eq 'failed') { Write-Warning "[$Apim] could not enumerate $Collection ($($r.Error))" }
         return $r.Items
     }
 
-    $svc = Invoke-Arm -Url $base
+    $svc = $singles[0]
     $instanceInfo = [ordered]@{ subscriptionId = $Sub; resourceGroup = $Rg; name = $Apim }
     if ($svc.Ok) {
         $instanceInfo.sku = Get-Prop $svc.Data 'sku.name'
@@ -300,7 +311,7 @@ function Invoke-InstanceDiscovery {
     }
 
     # 8. Direct management API (tenant access) keys
-    $ta = Invoke-Arm -Url "$base/tenant/access"
+    $ta = $singles[1]
     if ($ta.Ok) {
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'tenant/access'; status = 'ok'; count = 1; error = $null })
         $enabled = [bool](Get-Prop $ta.Data 'properties.enabled')
@@ -308,7 +319,7 @@ function Invoke-InstanceDiscovery {
                     directManagementApiEnabled = $enabled }))
     }
     else {
-        $st = if ($ta.NotFound -or $ta.Error -match 'Bad Request') { 'not-supported' } else { 'failed' }
+        $st = if ($ta.NotFound -or $ta.Error -match 'Bad ?Request') { 'not-supported' } else { 'failed' }
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'tenant/access'; status = $st; count = 0; error = $ta.Error })
         if ($st -eq 'failed') { Write-Warning "[$Apim] could not read tenant/access ($($ta.Error))" }
     }
@@ -317,20 +328,25 @@ function Invoke-InstanceDiscovery {
     $policyTargets = [System.Collections.Generic.List[object]]::new()
     $policyTargets.Add(@{ id = 'global'; scope = 'global'; url = 'policies' })
     foreach ($p in & $list 'products' 'products') { $policyTargets.Add(@{ id = "product:$($p.name)"; scope = 'product'; url = "products/$($p.name)/policies" }) }
-    foreach ($a in & $list 'apis' 'apis') {
-        $policyTargets.Add(@{ id = "api:$($a.name)"; scope = 'api'; url = "apis/$($a.name)/policies" })
-        if (-not $SkipOperationPolicies) {
-            foreach ($op in & $list "apis/$($a.name)/operations" "apis/$($a.name)/operations") {
-                $policyTargets.Add(@{ id = "operation:$($a.name)/$($op.name)"; scope = 'operation'; url = "apis/$($a.name)/operations/$($op.name)/policies" })
-            }
-        }
-    }
+    $apis = @(& $list 'apis' 'apis')
+    foreach ($a in $apis) { $policyTargets.Add(@{ id = "api:$($a.name)"; scope = 'api'; url = "apis/$($a.name)/policies" }) }
     if ($SkipOperationPolicies) {
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'operation-policies'; status = 'skipped'; count = 0; error = 'Skipped by -SkipOperationPolicies.' })
     }
+    elseif ($apis.Count -gt 0) {
+        $opResults = Get-ArmCollections -Urls @($apis | ForEach-Object { "$base/apis/$($_.name)/operations" }) -ThrottleLimit $ThrottleLimit
+        for ($i = 0; $i -lt $apis.Count; $i++) {
+            $an = $apis[$i].name
+            foreach ($op in & $list "apis/$an/operations" "apis/$an/operations" -Result $opResults[$i]) {
+                $policyTargets.Add(@{ id = "operation:$an/$($op.name)"; scope = 'operation'; url = "apis/$an/operations/$($op.name)/policies" })
+            }
+        }
+    }
     $policiesScanned = 0
-    foreach ($t in $policyTargets) {
-        $r = Get-ArmCollection -Url "$base/$($t.url)"
+    $polResults = Get-ArmCollections -Urls @($policyTargets | ForEach-Object { "$base/$($_.url)" }) -ThrottleLimit $ThrottleLimit
+    for ($pi = 0; $pi -lt $policyTargets.Count; $pi++) {
+        $t = $policyTargets[$pi]
+        $r = $polResults[$pi]
         if (-not $r.Ok) {
             if (-not $r.NotFound) { $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = "policy:$($t.id)"; status = 'failed'; count = 0; error = $r.Error }); Write-Warning "[$Apim] could not read policy $($t.id) ($($r.Error))" }
             continue
@@ -375,12 +391,12 @@ function Invoke-InstanceDiscovery {
     $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'policies-scanned'; status = 'ok'; count = $policiesScanned; error = $null })
 
     # 10. Workspaces are not scanned: flag them so coverage is not overstated.
-    $ws = Get-ArmCollection -Url "$base/workspaces"
+    $ws = $pre['workspaces']
     if ($ws.Ok -and $ws.Items.Count -gt 0) {
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'workspaces'; status = 'not-scanned'; count = $ws.Items.Count; error = 'Workspace-scoped resources are not covered by this script.' })
         Write-Warning "[$Apim] has $($ws.Items.Count) workspace(s); workspace-scoped credentials are NOT scanned."
     }
-    elseif (-not $ws.Ok -and -not ($ws.NotFound -or $ws.Error -match 'Bad Request|MethodNotAllowed|NotSupported')) {
+    elseif (-not $ws.Ok -and -not ($ws.NotFound -or $ws.Error -match $NotSupportedRx)) {
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'workspaces'; status = 'failed'; count = 0; error = $ws.Error })
         Write-Warning "[$Apim] could not enumerate workspaces ($($ws.Error))"
     }
@@ -393,8 +409,9 @@ $account = Initialize-AzCli
 
 $targets = @()
 if ($AllSubscriptions) {
-    $subs = Invoke-AzCli -Arguments @('account', 'list', '--query', '[?state==`Enabled`].id', '-o', 'json')
-    $subIds = @($subs.Stdout | ConvertFrom-Json)
+    $subs = Get-ArmCollection -Url 'https://management.azure.com/subscriptions?api-version=2022-12-01'
+    if (-not $subs.Ok) { throw "Could not list subscriptions ($($subs.Error))." }
+    $subIds = @($subs.Items | Where-Object state -EQ 'Enabled' | ForEach-Object subscriptionId)
 }
 else {
     $subIds = @($(if ($SubscriptionId) { $SubscriptionId } else { $account.id }))
@@ -407,15 +424,15 @@ foreach ($sid in $subIds) {
         $targets += [pscustomobject]@{ sub = $sid; rg = $ResourceGroup; name = $Name }
         continue
     }
-    $a = @('apim', 'list', '--subscription', $sid, '-o', 'json')
-    if ($ResourceGroup) { $a += @('--resource-group', $ResourceGroup) }
-    $r = Invoke-AzCli -Arguments $a
-    if ($r.ExitCode -ne 0) {
+    $listUrl = if ($ResourceGroup) { "https://management.azure.com/subscriptions/$sid/resourceGroups/$ResourceGroup/providers/Microsoft.ApiManagement/service" }
+    else { "https://management.azure.com/subscriptions/$sid/providers/Microsoft.ApiManagement/service" }
+    $r = Get-ArmCollection -Url $listUrl
+    if (-not $r.Ok) {
         Write-Warning "Could not list APIM in subscription $sid ($($r.Error))"
         $globalCoverage.Add([pscustomobject][ordered]@{ instance = $null; collection = "apim-list:$sid"; status = 'failed'; count = 0; error = $r.Error })
         continue
     }
-    foreach ($s in @($r.Stdout | ConvertFrom-Json)) { $targets += [pscustomobject]@{ sub = $sid; rg = $s.resourceGroup; name = $s.name } }
+    foreach ($s in $r.Items) { $targets += [pscustomobject]@{ sub = $sid; rg = ($s.id -split '/')[4]; name = $s.name } }
 }
 if (-not $targets) { throw 'No API Management instances found.' }
 

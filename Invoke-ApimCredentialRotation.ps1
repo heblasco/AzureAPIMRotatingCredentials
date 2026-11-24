@@ -22,8 +22,9 @@
       -Incident   Regenerates BOTH keys and includes 'master'. Every caller using the old keys breaks
                   immediately. Use when keys are (or may be) compromised.
 
-    Secret safety: secret values are never printed or written. New named-value values travel to az
-    through a private temp file (current-user ACL set before writing, wiped and deleted in finally).
+    Secret safety: secret values are never printed or written. New named-value values are sent to ARM
+    directly from memory over TLS (no temp files). Azure CLI is used only for sign-in and to obtain an
+    ARM access token, which is never output.
     -Verify reads secrets (listSecrets/listKeys/listValue) only to compare in-memory SHA-256 hashes;
     only booleans are reported.
 
@@ -129,6 +130,31 @@ function Wait-NamedValue {
     return $null
 }
 
+# Follows an ARM 202 (Azure-AsyncOperation or Location header). $true = completed, $false = failed or
+# timed out, $null = no async header to follow (caller falls back to other evidence).
+function Wait-ArmAsync {
+    param($Response, [int]$TimeoutSec = 180)
+    if ($Response.StatusCode -ne 202) { return $true }
+    $op = $Response.Headers['Azure-AsyncOperation']; $loc = $Response.Headers['Location']
+    if (-not $op -and -not $loc) { return $null }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    do {
+        Start-Sleep -Seconds $(if ($Response.RetryAfter) { [Math]::Min($Response.RetryAfter, 30) } else { 5 })
+        if ($op) {
+            $g = Invoke-Arm -Url $op
+            $st = if ($g.Ok) { Get-Prop $g.Data 'status' } else { $null }
+            if ($st -eq 'Succeeded') { return $true }
+            if ($st -in 'Failed', 'Canceled' -or (-not $g.Ok -and -not $g.Transient)) { return $false }
+        }
+        else {
+            $g = Invoke-Arm -Url $loc
+            if ($g.Ok -and $g.StatusCode -ne 202) { return $true }
+            if (-not $g.Ok -and -not $g.Transient) { return $false }
+        }
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 $mode = if ($Incident) { 'incident' } else { 'planned' }
 Write-Host ("Mode: {0} | keys: {1} | master: {2} | {3}" -f $mode, ($keysToRotate -join '+'), [bool]$IncludeMaster, $(if ($Apply) { 'APPLY' } else { 'DRY-RUN (use -Apply to change anything)' })) -ForegroundColor Yellow
 if ($Apply -and $keysToRotate.Count -eq 2) {
@@ -157,19 +183,14 @@ foreach ($it in $selected) {
             foreach ($k in $keysToRotate) {
                 if (-not $Apply) { $keyResults += [ordered]@{ key = $k; status = 'would-regenerate' }; continue }
                 $kTitle = (Get-Culture).TextInfo.ToTitleCase($k)
-                $bodyFile = $null
                 try {
                     switch ($it.type) {
                         'subscription-key' { $r = Invoke-Arm -Method post -Url "$base/subscriptions/$($it.id)/regenerate${kTitle}Key" }
                         'tenant-access' { $r = Invoke-Arm -Method post -Url "$base/tenant/access/regenerate${kTitle}Key" }
-                        'gateway-key' {
-                            $bodyFile = New-PrivateTempFile
-                            [IO.File]::WriteAllText($bodyFile, (@{ keyType = $k } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-                            $r = Invoke-Arm -Method post -Url "$base/gateways/$($it.id)/regenerateKey" -BodyFile $bodyFile
-                        }
+                        'gateway-key' { $r = Invoke-Arm -Method post -Url "$base/gateways/$($it.id)/regenerateKey" -Body @{ keyType = $k } }
                     }
                 }
-                finally { Remove-PrivateTempFile $bodyFile }
+                catch { $r = [pscustomobject]@{ Ok = $false; Error = 'RequestError' } }
                 $keyResults += [ordered]@{ key = $k; status = $(if ($r.Ok) { 'regenerated' } else { 'failed' }); error = $r.Error }
                 Write-Host ("   {0}: {1}" -f $k, $(if ($r.Ok) { 'regenerated' } else { "FAILED ($($r.Error))" })) -ForegroundColor $(if ($r.Ok) { 'Green' } else { 'Red' })
             }
@@ -233,18 +254,13 @@ foreach ($it in $selected) {
             $before = if ($Verify) { Get-KeyHashes 'named-value-secret' $base $it.id } else { $null }
             $new = Get-NewSecretValue $it.id
             if ([string]::IsNullOrEmpty($new)) { $res.status = 'skipped'; $res.reason = 'no new value supplied'; Write-Host "   skipped: $($res.reason)" -ForegroundColor DarkYellow; break }
-            $bodyFile = $null
-            try {
-                $bodyFile = New-PrivateTempFile
-                [IO.File]::WriteAllText($bodyFile, (@{ properties = @{ value = $new; secret = $true } } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-                $new = $null
-                $r = Invoke-Arm -Method patch -Url $nvUrl -BodyFile $bodyFile -Headers @('If-Match=*')
-            }
-            finally { Remove-PrivateTempFile $bodyFile; $new = $null }
+            # The body exists only in memory and is sent straight to ARM over TLS; nothing touches disk.
+            try { $r = Invoke-Arm -Method patch -Url $nvUrl -Body @{ properties = @{ value = $new; secret = $true } } -Headers @('If-Match=*') }
+            catch { $r = [pscustomobject]@{ Ok = $false; Error = 'RequestError' } }
+            finally { $new = $null }
             if (-not $r.Ok) { $res.status = 'failed'; $res.reason = $r.Error; Write-Host "   FAILED ($($r.Error))" -ForegroundColor Red; break }
-            # az rest does not expose the async-operation header of a 202, so completion is inferred:
-            # with -Verify, poll until the stored value hash changes (strong evidence); otherwise poll
-            # provisioningState (weaker: reported as 'updated' with that caveat).
+            # With -Verify, poll until the stored value hash changes (strong evidence). Otherwise follow the
+            # ARM async-operation header of a 202, falling back to provisioningState.
             if ($Verify) {
                 if (-not $before) {
                     $res.status = 'updated'; $res.verified = $false
@@ -263,10 +279,17 @@ foreach ($it in $selected) {
                 }
             }
             else {
-                Start-Sleep -Seconds 5
-                $final = Wait-NamedValue -Url $nvUrl -Done { param($d) $ps = Get-Prop $d 'properties.provisioningState'; -not $ps -or $ps -eq 'Succeeded' }
-                $res.status = if ($final) { 'updated' } else { 'failed' }
-                $res.reason = 'Update accepted (completion inferred from provisioningState; use -Verify for proof). Revoke the OLD credential at its issuer after testing.'
+                $async = Wait-ArmAsync $r
+                if ($null -ne $async) {
+                    $res.status = if ($async) { 'updated' } else { 'failed' }
+                    $res.reason = if ($async) { 'Value replaced in APIM (operation completed). Revoke the OLD credential at its issuer after testing.' } else { 'Async update operation failed or timed out.' }
+                }
+                else {
+                    Start-Sleep -Seconds 5
+                    $final = Wait-NamedValue -Url $nvUrl -Done { param($d) $ps = Get-Prop $d 'properties.provisioningState'; -not $ps -or $ps -eq 'Succeeded' }
+                    $res.status = if ($final) { 'updated' } else { 'failed' }
+                    $res.reason = 'Update accepted (completion inferred from provisioningState; use -Verify for proof). Revoke the OLD credential at its issuer after testing.'
+                }
             }
             Write-Host "   $($res.status)" -ForegroundColor $(if ($res.status -eq 'updated') { 'Green' } else { 'Red' })
         }
