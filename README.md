@@ -39,6 +39,111 @@ mutations are never retried.
 Use `-ThrottleLimit` (default 16) on `Get-ApimCredentials.ps1` to change the number of concurrent
 requests, for example lower it if ARM starts throttling.
 
+## Step-by-step guide
+
+### Step 1 – Install the prerequisites
+
+```powershell
+winget install Microsoft.PowerShell      # PowerShell 7 (Windows; see docs for macOS/Linux)
+winget install Microsoft.AzureCLI        # Azure CLI
+```
+
+Open a new **PowerShell 7** terminal (`pwsh`) after installing.
+
+### Step 2 – Get the scripts
+
+```powershell
+git clone https://github.com/heblasco/AzureAPIMRotatingCredentials.git
+cd AzureAPIMRotatingCredentials
+```
+
+On Windows, if the execution policy blocks the scripts:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Get-ChildItem *.ps1, *.psm1 | Unblock-File
+```
+
+### Step 3 – Sign in to Azure
+
+```powershell
+az login
+az account set --subscription "<subscription-name-or-id>"
+az account show --query "{subscription:name, user:user.name}" -o table
+```
+
+### Step 4 – Discover affected credentials (read-only)
+
+```powershell
+./Get-ApimCredentials.ps1 -ResourceGroup <resource-group> -Name <apim-name>
+```
+
+This writes `apim-credentials-inventory.json`. Nothing is changed in Azure.
+
+### Step 5 – Review the inventory
+
+```powershell
+$inv = Get-Content ./apim-credentials-inventory.json -Raw | ConvertFrom-Json
+$inv.summary                                              # totals and coverageComplete
+$inv.items | Format-Table type, id, action, note -Wrap    # what was found
+$inv.coverage | Where-Object status -ne 'ok'              # anything not fully scanned
+```
+
+- `action = auto` items will be rotated by the next script.
+- `action = manual` items (backends, IdP secrets, loggers, certificates, policies…) must be rotated
+  by hand following the `note` of each item.
+- If `summary.coverageComplete` is `false`, check `coverage` before trusting the result.
+
+### Step 6 – Dry-run the rotation
+
+```powershell
+./Invoke-ApimCredentialRotation.ps1 -InventoryFile ./apim-credentials-inventory.json -Incident
+```
+
+Shows exactly what would be rotated. Nothing is changed. Drop `-Incident` to preview a planned
+(secondary-key only) rotation instead.
+
+### Step 7 – Provide new values for secret named values (only if listed)
+
+Items of type `named-value-secret` need the new value you obtained from the issuer. Either set an
+environment variable before running (name = `APIM_NV_` + ID in upper case, non-alphanumerics as `_`):
+
+```powershell
+$env:APIM_NV_API_KEY = Read-Host 'New value for api-key' -MaskInput
+```
+
+or let the script prompt for it securely. For Key Vault-backed named values, rotate the secret in
+Key Vault **first**; the script then refreshes APIM.
+
+### Step 8 – Rotate
+
+```powershell
+# Incident (credentials compromised): both keys, including 'master'
+./Invoke-ApimCredentialRotation.ps1 -InventoryFile ./apim-credentials-inventory.json -Incident -Apply -Verify
+
+# Planned rotation instead: secondary key only (repeat later with -Key Primary)
+./Invoke-ApimCredentialRotation.ps1 -InventoryFile ./apim-credentials-inventory.json -Apply -Verify
+```
+
+Answer `Y` when asked to confirm (or add `-Force` for unattended runs).
+
+### Step 9 – Check the results
+
+```powershell
+Import-Csv ./apim-rotation-feedback-*.csv | Format-Table instance, type, id, changed, detail -Wrap
+```
+
+- `changed = Yes` → rotated and verified.
+- Anything else → see `detail`, and `unremediated` in the JSON report.
+- Exit code `0` means success; `1` means something failed, was partial or could not be verified.
+
+### Step 10 – Finish the remediation
+
+1. Distribute the new keys to legitimate callers and test your APIs.
+2. Revoke the old credentials at their issuers (Key Vault versions, backends, IdP secrets…).
+3. Rotate the `manual` items.
+4. Run Step 4 again to confirm the final state.
+
 ## 1. Discover affected credentials
 
 ```powershell
