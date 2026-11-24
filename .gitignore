@@ -1,0 +1,5 @@
+# Generated outputs contain subscription IDs, resource names and the signed-in account.
+apim-credentials-inventory*.json
+apim-rotation-report*.json
+apim-rotation-feedback*.csv
+*.inventory.json
