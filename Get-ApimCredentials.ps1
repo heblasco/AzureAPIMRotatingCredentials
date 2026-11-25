@@ -10,7 +10,8 @@
 
     Secret values are NEVER read: listSecrets / listValue / show-secret are not called and only an
     allow-list of non-secret fields is written. Policies are inspected in memory; only line numbers,
-    element names and rule names are reported, never policy content.
+    element names and rule names are reported, never policy content, except the vault and object names
+    of direct Key Vault calls (policy-keyvault-call).
 
     Policy and naming analysis is heuristic. Any collection that could not be enumerated is reported
     in "coverage" with status "failed" and the inventory is flagged as incomplete.
@@ -158,6 +159,43 @@ function Get-PolicyCertificateRefs {
     param([string]$Xml)
     if ([string]::IsNullOrEmpty($Xml)) { return @() }
     @([regex]::Matches($Xml, '<authentication-certificate\b[^>]*?\b(?:certificate-id|thumbprint)\s*=\s*"([^"{}@]+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+}
+
+# Direct Key Vault data-plane calls made by a policy at runtime (send-request, set-backend-service, etc.).
+# {{named values}} are resolved with the known non-secret values first so URLs held in named values are found.
+# Returns calls (vault/object per line, or dynamic when built at runtime), managed identity auth lines for
+# Key Vault, and cache-store-value lines (cached values survive a Key Vault rotation until they expire).
+$KeyVaultDnsRx = 'vault\.(?:azure\.net|azure\.cn|usgovcloudapi\.net|microsoftazure\.de)'
+function Get-PolicyKeyVaultCalls {
+    param([string]$Xml, [hashtable]$NamedValueValues)
+    $res = [ordered]@{ calls = @(); managedIdentityLines = @(); cacheStoreLines = @() }
+    if ([string]::IsNullOrEmpty($Xml)) { return [pscustomobject]$res }
+    $urlRx = "(?i)https://([a-z0-9-]{3,24})\.$KeyVaultDnsRx(?::443)?(?:/(secrets|keys|certificates)(?:/([A-Za-z0-9-]+)(?![A-Za-z0-9-]*(?:&quot;|[`"'\s])*\+))?(?:/([0-9a-fA-F]{32}))?)?"
+    $calls = [System.Collections.Generic.List[object]]::new()
+    $lines = $Xml -split '\r?\n'
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $l = [regex]::Replace($lines[$i], '\{\{\s*([^{}]+?)\s*\}\}', {
+                param($m) $k = $m.Groups[1].Value.ToLowerInvariant()
+                if ($NamedValueValues -and $NamedValueValues.ContainsKey($k)) { $NamedValueValues[$k] } else { $m.Value } })
+        if ($l -match '(?i)<cache-store-value\b') { $res.cacheStoreLines += $i + 1 }
+        if ($l -match "(?i)<authentication-managed-identity\b[^>]*\bresource\s*=\s*[`"']https://$KeyVaultDnsRx") { $res.managedIdentityLines += $i + 1; continue }
+        $found = [regex]::Matches($l, $urlRx)
+        foreach ($m in $found) {
+            $calls.Add([pscustomobject][ordered]@{
+                    line = $i + 1; vaultName = $m.Groups[1].Value.ToLowerInvariant()
+                    objectType = $(if ($m.Groups[2].Success) { $m.Groups[2].Value.ToLowerInvariant() } else { $null })
+                    objectName = $(if ($m.Groups[3].Success) { $m.Groups[3].Value } else { $null })
+                    version = $(if ($m.Groups[4].Success) { $m.Groups[4].Value.ToLowerInvariant() } else { $null })
+                    dynamic = -not $m.Groups[3].Success
+                })
+        }
+        # Vault host built at runtime (e.g. "https://" + name + ".vault.azure.net/...").
+        if ($found.Count -eq 0 -and $l -match "(?i)\.$KeyVaultDnsRx") {
+            $calls.Add([pscustomobject][ordered]@{ line = $i + 1; vaultName = $null; objectType = $null; objectName = $null; version = $null; dynamic = $true })
+        }
+    }
+    $res.calls = @($calls)
+    [pscustomobject]$res
 }
 
 function New-Item2 {
@@ -421,6 +459,24 @@ function Invoke-InstanceDiscovery {
         }
     }
     $policiesScanned = 0
+    # Non-secret named value values (in memory only) so Key Vault URLs held in {{named values}} are resolved.
+    $nvPlain = @{}
+    foreach ($nv in @($pre['namedValues'].Items)) {
+        if (-not (Get-Prop $nv 'properties.secret') -and (Get-Prop $nv 'properties.value')) {
+            foreach ($k in @($nv.name, (Get-Prop $nv 'properties.displayName')) | Where-Object { $_ }) { $nvPlain[$k.ToLowerInvariant()] = Get-Prop $nv 'properties.value' }
+        }
+    }
+    $addKvPolicy = {
+        param([string]$Id, [string]$Scope, [string]$Xml)
+        $kv = Get-PolicyKeyVaultCalls -Xml $Xml -NamedValueValues $nvPlain
+        if ($kv.calls.Count -eq 0 -and $kv.managedIdentityLines.Count -eq 0) { return }
+        $cached = $kv.cacheStoreLines.Count -gt 0
+        $items.Add((New-Item2 $ctx 'policy-keyvault-call' $Id 'manual' ("Policy reads Key Vault directly at runtime. Rotate the listed Key Vault objects (new credential at the issuer, new version); the policy picks up the latest version on its next call unless the URL pins a version." + $(if ($cached) { ' The policy caches values (cache-store-value): purge the cache or wait for the cache duration after rotating.' } else { '' }) + ' Retest the API afterwards.') @{
+                    scope = $Scope; keyVaultCalls = $kv.calls; managedIdentityLines = $kv.managedIdentityLines
+                    cachesValue = $cached; cacheStoreLines = $kv.cacheStoreLines
+                    exposure = 'key-vault'; rotationRequired = $true
+                }))
+    }
     $polResults = Get-ArmCollections -Urls @($policyTargets | ForEach-Object { "$base/$($_.url)" }) -ThrottleLimit $ThrottleLimit
     for ($pi = 0; $pi -lt $policyTargets.Count; $pi++) {
         $t = $policyTargets[$pi]
@@ -435,6 +491,7 @@ function Invoke-InstanceDiscovery {
             $policiesScanned++
             & $addRef $nvRefs @(Get-NamedValueRefs $xml) "policy:$($t.id)"
             & $addRef $certRefs @(Get-PolicyCertificateRefs $xml) "policy:$($t.id)"
+            & $addKvPolicy $t.id $t.scope $xml
             $f = Get-PolicyFindings $xml
             if ($f.findings.Count -gt 0 -or -not $f.parsed) {
                 $items.Add((New-Item2 $ctx 'policy' $t.id 'manual' 'Possible hard-coded credential. Review the listed lines in the portal policy editor, rotate at the source and replace with a Key Vault-backed {{named value}}.' @{
@@ -460,6 +517,7 @@ function Invoke-InstanceDiscovery {
         $policiesScanned++
         & $addRef $nvRefs @(Get-NamedValueRefs $xml) "policy:fragment:$($frag.name)"
         & $addRef $certRefs @(Get-PolicyCertificateRefs $xml) "policy:fragment:$($frag.name)"
+        & $addKvPolicy "fragment:$($frag.name)" 'fragment' $xml
         $f = Get-PolicyFindings $xml
         if ($f.findings.Count -gt 0 -or -not $f.parsed) {
             $items.Add((New-Item2 $ctx 'policy' "fragment:$($frag.name)" 'manual' 'Possible hard-coded credential in policy fragment. Review in the portal, rotate at source, use a Key Vault-backed {{named value}}.' @{
@@ -545,8 +603,12 @@ foreach ($t in $targets) {
 # Every APIM item that loads a credential from Key Vault, plus the full contents (metadata only) of the
 # affected vaults: vaults referenced by APIM and vaults passed with -KeyVault.
 $kvLinked = @($allItems | Where-Object { $_.PSObject.Properties['keyVaultSecretId'] -and $_.keyVaultSecretId })
+$kvPolicy = @($allItems | Where-Object type -EQ 'policy-keyvault-call')
 $vaults = [ordered]@{}   # name -> @{ resourceId; explicit }
 foreach ($it in $kvLinked) { $ref = ConvertFrom-KeyVaultUri $it.keyVaultSecretId; if ($ref -and -not $vaults.Contains($ref.vaultName)) { $vaults[$ref.vaultName] = @{ resourceId = $null; explicit = $false } } }
+foreach ($c in @($kvPolicy | ForEach-Object { $_.keyVaultCalls } | Where-Object vaultName)) { if (-not $vaults.Contains($c.vaultName)) { $vaults[$c.vaultName] = @{ resourceId = $null; explicit = $false } } }
+$dynPolicies = @($kvPolicy | Where-Object { @($_.keyVaultCalls | Where-Object { -not $_.vaultName }).Count -gt 0 -or ($_.keyVaultCalls.Count -eq 0) })
+foreach ($p in $dynPolicies) { Write-Warning "[$($p.instance)] policy $($p.id) calls Key Vault with a URL built at runtime (or only authenticates to it): pass the vault(s) it uses with -KeyVault." }
 foreach ($kvArg in @($KeyVault | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
     $isId = $kvArg -match '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[^/]+$'
     $n = ($kvArg -split '/')[-1].ToLowerInvariant()
@@ -562,7 +624,7 @@ if ($vaults.Count -gt 0) {
     foreach ($vn in @($vaults.Keys)) {
         $v = $vaults[$vn]
         if (-not $v.resourceId) { $v.resourceId = $kvIdx.Index[$vn] }
-        $metaByVault[$vn] = @{ secrets = @{}; listed = $false }
+        $metaByVault[$vn] = @{ secrets = @{}; keys = @{}; listed = $false }
         if (-not $v.resourceId) {
             $allCoverage.Add([pscustomobject][ordered]@{ instance = $vn; collection = "keyvault:$vn"; status = 'not-found'; count = 0; error = 'Vault not found in the scanned subscriptions (other subscription or no access). Pass its resource ID with -KeyVault.' })
             Write-Warning "Key Vault '$vn' could not be resolved; its contents and versions are NOT checked."
@@ -574,6 +636,7 @@ if ($vaults.Count -gt 0) {
         $consumersOf = {
             param([string]$ObjName)
             @($kvLinked | Where-Object { $r = ConvertFrom-KeyVaultUri $_.keyVaultSecretId; $r -and $r.vaultName -eq $vn -and $r.name -eq $ObjName } | ForEach-Object { "$($_.instance)/$($_.type)/$($_.id)" })
+            @($kvPolicy | Where-Object { @($_.keyVaultCalls | Where-Object { $_.vaultName -eq $vn -and $_.objectName -eq $ObjName }).Count -gt 0 } | ForEach-Object { "$($_.instance)/policy:$($_.id)" })
         }
         if ($SkipKeyVaultContents) {
             $allCoverage.Add([pscustomobject][ordered]@{ instance = $vn; collection = "keyvault:$vn/contents"; status = 'skipped'; count = 0; error = 'Skipped by -SkipKeyVaultContents.' })
@@ -585,7 +648,7 @@ if ($vaults.Count -gt 0) {
                 if (-not $lr.Ok) { Write-Warning "Could not list $ot of Key Vault '$vn' ($($lr.Error))"; continue }
                 if ($ot -eq 'secrets') { $metaByVault[$vn].listed = $true }
                 foreach ($m in $lr.Items) {
-                    if ($ot -eq 'secrets') { $metaByVault[$vn].secrets[$m.name.ToLowerInvariant()] = $m }
+                    if ($ot -eq 'secrets') { $metaByVault[$vn].secrets[$m.name.ToLowerInvariant()] = $m } else { $metaByVault[$vn].keys[$m.name.ToLowerInvariant()] = $m }
                     $isCertLike = $ot -eq 'secrets' -and $m.contentType -match 'pkcs12|pem'
                     $note = if ($ot -eq 'keys') { 'Exposed Key Vault key: create a new key version (rotate), re-wrap / re-encrypt / re-sign what depends on it, then disable the old versions.' }
                     elseif ($isCertLike) { 'Exposed certificate / private key: reissue the certificate with a NEW key pair, store it as a new version, update consumers, then revoke the old certificate.' }
@@ -628,6 +691,26 @@ if ($vaults.Count -gt 0) {
                 assessment = $assess; apimLoadedLatestVersion = $loaded; metadataError = $(if ($mr -and -not $mr.Ok) { $mr.Error } else { $null })
             })
     }
+
+    # Assess every direct Key Vault call made by a policy (policies read the latest version at runtime).
+    foreach ($it in $kvPolicy) {
+        foreach ($c in @($it.keyVaultCalls)) {
+            $v = if ($c.vaultName) { $vaults[$c.vaultName] } else { $null }
+            $assess = 'dynamic-reference'
+            if ($c.vaultName -and -not $c.dynamic) {
+                $mr = $null
+                if ($v -and $v.resourceId) {
+                    # Certificates are also exposed as a secret with the same name.
+                    $m = if ($c.objectType -eq 'keys') { $metaByVault[$c.vaultName].keys[$c.objectName.ToLowerInvariant()] } else { $metaByVault[$c.vaultName].secrets[$c.objectName.ToLowerInvariant()] }
+                    $mr = if ($m) { [pscustomobject]@{ Ok = $true; NotFound = $false; Meta = $m } }
+                    elseif ($c.objectType -ne 'keys') { Get-KeyVaultSecretMeta -VaultResourceId $v.resourceId -Name $c.objectName }
+                }
+                $assess = Get-KeyVaultAssessment -Ref $c -MetaResult $mr -CutoffUtc $CutoffUtc
+            }
+            $c | Add-Member -Force -NotePropertyName vaultResourceId -NotePropertyValue (${v}?.resourceId)
+            $c | Add-Member -Force -NotePropertyName assessment -NotePropertyValue $assess
+        }
+    }
 }
 
 $failed = @($allCoverage | Where-Object status -In 'failed', 'not-scanned', 'skipped', 'not-found')
@@ -653,6 +736,7 @@ $inventory = [ordered]@{
         keyVaultLinkedItems = $kvLinked.Count
         keyVaultObjects  = @($allItems | Where-Object type -In 'keyvault-secret', 'keyvault-key').Count
         keyVaultPendingInKeyVault = @($kvLinked | Where-Object { $_.keyVault.assessment -in $kvPendingStates }).Count
+        keyVaultPolicyCallers = $kvPolicy.Count
         byType           = [ordered]@{}
     }
     coverage = $allCoverage
@@ -672,6 +756,7 @@ $allItems | Select-Object instance, type, id, action, @{n = 'detail'; e = {
             'policy' { "lines " + (($i.findings | ForEach-Object { $_.line } | Sort-Object -Unique) -join ',') }
             'policy-review' { "keyword lines " + ($i.keywordLines -join ',') }
             { $_ -in 'keyvault-secret', 'keyvault-key' } { "$($i.keyVaultAssessment); usedBy=$(@($i.usedBy).Count)" }
+            'policy-keyvault-call' { ((@($i.keyVaultCalls) | ForEach-Object { "L$($_.line) $(if ($_.vaultName) { $_.vaultName } else { '?' })/$(if ($_.objectName) { $_.objectName } else { '?' }): $($_.assessment)" }) + @(if ($i.managedIdentityLines) { "MI auth L$($i.managedIdentityLines -join ',')" }) + @(if ($i.cachesValue) { 'cached' })) -join '; ' }
             default {
                 if ($i.PSObject.Properties['keyVault'] -and $i.keyVault) { "KV $($i.keyVault.vaultName)/$($i.keyVault.objectName): $($i.keyVault.assessment)" }
                 elseif ($i.PSObject.Properties['subject']) { $i.subject }
@@ -681,7 +766,7 @@ $allItems | Select-Object instance, type, id, action, @{n = 'detail'; e = {
 
 Write-Host ("Items: {0} (auto: {1}, manual: {2})" -f $inventory.summary.totalItems, $inventory.summary.autoRotatable, $inventory.summary.manual)
 if ($vaults.Count -gt 0) {
-    Write-Host ("Key Vault: {0} APIM item(s) linked, {1} vault object(s) to rotate, {2} linked item(s) still pending in Key Vault{3}" -f $inventory.summary.keyVaultLinkedItems, $inventory.summary.keyVaultObjects, $inventory.summary.keyVaultPendingInKeyVault, $(if (-not $CutoffUtc) { ' (no -CompromisedSince: versions cannot be judged)' } else { '' }))
+    Write-Host ("Key Vault: {0} APIM item(s) linked, {1} policy(ies) calling Key Vault directly, {2} vault object(s) to rotate, {3} linked item(s) still pending in Key Vault{4}" -f $inventory.summary.keyVaultLinkedItems, $inventory.summary.keyVaultPolicyCallers, $inventory.summary.keyVaultObjects, $inventory.summary.keyVaultPendingInKeyVault, $(if (-not $CutoffUtc) { ' (no -CompromisedSince: versions cannot be judged)' } else { '' }))
 }
 if ($failed) { Write-Warning "Coverage INCOMPLETE: $($failed.Count) collection(s) failed. See 'coverage' in $OutFile." }
 Write-Host "Inventory written to $OutFile (no secret values included)." -ForegroundColor Green

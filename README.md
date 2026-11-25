@@ -168,7 +168,7 @@ Output: `apim-credentials-inventory.json`
 ```text
 { metadata { ..., compromisedSinceUtc, keyVaults[] },
   summary { coverageComplete, totalItems, autoRotatable, manual, keyVaultLinkedItems, keyVaultObjects,
-            keyVaultPendingInKeyVault, byType }, coverage[], items[] }
+            keyVaultPendingInKeyVault, keyVaultPolicyCallers, byType }, coverage[], items[] }
 ```
 
 What is scanned (API version `2024-05-01`):
@@ -188,12 +188,13 @@ What is scanned (API version `2024-05-01`):
 | Certificates loaded from Key Vault | `certificate-kv` | auto (refresh after reissuing in Key Vault) |
 | Custom domain certificates loaded from Key Vault | `hostname-certificate-kv` | manual |
 | Secrets and keys in the affected Key Vaults (metadata only) | `keyvault-secret`, `keyvault-key` | manual (rotate at the issuer) |
+| Policies that call Key Vault directly at runtime | `policy-keyvault-call` | manual |
 | Global, product, API and operation policies, policy fragments | `policy` (literal secret detected), `policy-review` (keywords only) | manual review (heuristic) |
 | Workspaces | coverage only | reported as `not-scanned` (inventory marked incomplete) |
 
 Every collection is listed in `coverage`. If anything could not be enumerated (or was skipped),
 `summary.coverageComplete` is `false`. Policy detection is heuristic and reports only line numbers
-and rule names, never policy content.
+and rule names, never policy content (except vault and object names of direct Key Vault calls).
 
 Named values and certificates also get a `usedBy` list (backends, loggers, caches, policies,
 gateway hostname configurations) so you know what breaks or must be retested when they change.
@@ -229,6 +230,17 @@ Each APIM item that loads from Key Vault gets `exposure = key-vault`, `rotationR
 A vault that cannot be resolved is reported as `not-found` in `coverage` (incomplete). Items stay
 `rotationRequired` until you revoke the old credential at its issuer; a new version is not proof
 that the exposed credential is no longer valid.
+
+Policies (and policy fragments) that call the Key Vault data plane themselves, e.g. a
+`send-request` to `https://<vault>.vault.azure.net/secrets/<name>` with
+`authentication-managed-identity resource="https://vault.azure.net"`, are reported as
+`policy-keyvault-call`. URLs held in non-secret `{{named values}}` are resolved. Each item lists
+`keyVaultCalls` (line, vault, object, pinned version, `assessment`), `managedIdentityLines` and
+`cachesValue`. Their vaults are scanned automatically, and the policy appears in the `usedBy` of the
+Key Vault secrets it reads. There is nothing to refresh in APIM: the policy reads the latest version
+on its next call, unless the URL pins a version or the value is kept with `cache-store-value` (purge
+the cache or wait for its duration). Calls whose URL is built at runtime are marked `dynamic` with
+assessment `dynamic-reference`; pass those vaults with `-KeyVault`.
 
 Recommended flow:
 
