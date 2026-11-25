@@ -11,7 +11,14 @@
       tenant-access       POST tenant/access/regeneratePrimaryKey|regenerateSecondaryKey
       gateway-key         POST gateways/{id}/regenerateKey  {"keyType":"primary|secondary"}
       named-value-kv      POST namedValues/{id}/refreshSecret (rotate the secret in Key Vault FIRST)
+      certificate-kv      POST certificates/{id}/refreshSecret (reissue the certificate in Key Vault FIRST)
       named-value-secret  PATCH namedValues/{id} with a NEW value you supply (env var APIM_NV_<ID> or prompt)
+
+    Key Vault references are BLOCKED (never refreshed) when the latest Key Vault version is not newer than
+    -CompromisedSince, when they are pinned to an older version, or when the version age cannot be determined.
+    Without -CompromisedSince a refresh is reported as Unverified. A refresh is verified only when APIM loaded
+    after the latest version was created, that version is still the latest, and (certificates) the thumbprint
+    changed. Key Vault objects themselves (keyvault-secret / keyvault-key) are always manual.
 
     Manual types (backends, OAuth/OIDC/IdP, credential manager, loggers, caches, certificates, policies,
     plain named values) are never modified; they are reported as unremediated with next steps.
@@ -38,8 +45,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$InventoryFile,
-    [ValidateSet('subscription-key', 'tenant-access', 'gateway-key', 'named-value-kv', 'named-value-secret')]
-    [string[]]$Types = @('subscription-key', 'tenant-access', 'gateway-key', 'named-value-kv', 'named-value-secret'),
+    [ValidateSet('subscription-key', 'tenant-access', 'gateway-key', 'named-value-kv', 'certificate-kv', 'named-value-secret')]
+    [string[]]$Types = @('subscription-key', 'tenant-access', 'gateway-key', 'named-value-kv', 'certificate-kv', 'named-value-secret'),
     [string]$Instance,
     [string[]]$Id,
     [ValidateSet('Primary', 'Secondary', 'Both')][string]$Key = 'Secondary',
@@ -50,6 +57,9 @@ param(
     [switch]$Apply,
     [switch]$Force,
     [switch]$Verify,
+    # Start of the exposure window (with offset, e.g. 2026-11-20T00:00:00Z). Defaults to the inventory value.
+    # Key Vault references whose latest version is not newer than this are BLOCKED (refresh would reload the exposed value).
+    [string]$CompromisedSince,
     [string]$ReportFile = ("apim-rotation-report-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss')),
     # CSV with one row per item: changed = Yes | Partial | Unverified | No | No (dry-run). Defaults next to -ReportFile.
     [string]$FeedbackFile
@@ -68,6 +78,12 @@ $inventory = Get-Content -LiteralPath $InventoryFile -Raw | ConvertFrom-Json -De
 if (-not $inventory.summary.coverageComplete) {
     Write-Warning 'The inventory has INCOMPLETE coverage: some collections could not be enumerated. Re-run discovery before declaring the incident remediated.'
 }
+$invCutoff = ConvertTo-UtcDateTime $inventory.metadata.compromisedSinceUtc
+$CutoffUtc = ConvertTo-CutoffUtc $CompromisedSince
+if ($CutoffUtc -and $invCutoff -and $CutoffUtc -ne $invCutoff) {
+    throw "-CompromisedSince ($($CutoffUtc.ToString('o'))) differs from the inventory ($($invCutoff.ToString('o'))). Re-run discovery with the same value."
+}
+if (-not $CutoffUtc) { $CutoffUtc = $invCutoff }
 
 $account = Initialize-AzCli
 
@@ -219,27 +235,76 @@ foreach ($it in $selected) {
             if ($it.type -eq 'gateway-key' -and $Apply) { $res.reason = 'Generate a new gateway token from the new key and redeploy the self-hosted gateway.' }
         }
 
-        'named-value-kv' {
+        { $_ -in 'named-value-kv', 'certificate-kv' } {
             $res.issuerRevocationRequired = $true
-            $nvUrl = "$base/namedValues/$($it.id)"
-            $cur = Invoke-Arm -Url $nvUrl
+            $isCert = $it.type -eq 'certificate-kv'
+            $objUrl = "$base/$(if ($isCert) { 'certificates' } else { 'namedValues' })/$($it.id)"
+            $skip = { param($why) $res.status = 'skipped'; $res.reason = $why; Write-Host "   skipped: $why" -ForegroundColor DarkYellow }
+            $cur = Invoke-Arm -Url $objUrl
             if (-not $cur.Ok) { $res.status = 'failed'; $res.reason = $cur.Error; break }
             $kvId = Get-Prop $cur.Data 'properties.keyVault.secretIdentifier'
-            $pinned = $kvId -match '/secrets/[^/]+/[0-9a-fA-F]{32}/?$'
-            if ($pinned -and -not $AllowPinnedRefresh) {
-                $res.status = 'skipped'; $res.reason = 'version-pinned Key Vault reference: point it to the new secret version (or use -AllowPinnedRefresh if already updated)'
-                Write-Host "   skipped: $($res.reason)" -ForegroundColor DarkYellow; break
+            if (-not $kvId) { & $skip 'no longer Key Vault-backed; re-run discovery'; break }
+            if ($it.PSObject.Properties['keyVaultSecretId'] -and $it.keyVaultSecretId -and $kvId -ne $it.keyVaultSecretId) { & $skip 'Key Vault reference changed since discovery; re-run discovery'; break }
+            $ref = ConvertFrom-KeyVaultUri $kvId
+            if ($ref.version -and -not $AllowPinnedRefresh) {
+                & $skip 'version-pinned Key Vault reference: point it to the new secret version (or use -AllowPinnedRefresh if already updated)'; break
             }
-            if (-not $Apply) { $res.status = 'would-refresh'; Write-Host '   would refresh from Key Vault (rotate the secret in Key Vault first)'; break }
-            $prevTs = Get-Prop $cur.Data 'properties.keyVault.lastStatus.timeStampUtc'
-            $r = Invoke-Arm -Method post -Url "$nvUrl/refreshSecret"
+
+            # Fresh Key Vault metadata (ARM control plane; values are never read).
+            $vaultRid = if ($it.PSObject.Properties['keyVault'] -and $it.keyVault) { $it.keyVault.vaultResourceId } else { $null }
+            $meta = if ($vaultRid -and $ref.objectType -eq 'secrets') { Get-KeyVaultSecretMeta -VaultResourceId $vaultRid -Name $ref.name } else { $null }
+            $assess = Get-KeyVaultAssessment -Ref $ref -MetaResult $meta -CutoffUtc $CutoffUtc
+            $res.keyVaultAssessment = $assess
+            $blockedStates = @('not-rotated-in-key-vault', 'pinned-to-older-version', 'secret-not-found', 'unknown') + @(if ($CutoffUtc) { 'metadata-unavailable' })
+            if ($assess -in $blockedStates) {
+                $res.status = 'blocked'
+                $res.reason = switch ($assess) {
+                    'not-rotated-in-key-vault' { "the latest Key Vault version was created before -CompromisedSince ($($CutoffUtc.ToString('o'))): store a NEW secret version in Key Vault first, refresh would reload the exposed value" }
+                    'pinned-to-older-version' { 'reference pinned to an older Key Vault version: update the identifier to the new version first' }
+                    'secret-not-found' { 'Key Vault secret not found' }
+                    'metadata-unavailable' { "Key Vault metadata unavailable ($($meta.Error)); cannot prove a new version exists (pass -KeyVault <resourceId> to discovery or grant read access)" }
+                    default { 'Key Vault version age could not be determined' }
+                }
+                Write-Host "   BLOCKED: $($res.reason)" -ForegroundColor Red; break
+            }
+            if (-not $CutoffUtc) { Write-Warning "   No -CompromisedSince: cannot prove the Key Vault value is new. Result will be Unverified." }
+            if (-not $Apply) { $res.status = 'would-refresh'; Write-Host "   would refresh from Key Vault ($assess)"; break }
+
+            $prevTs = ConvertTo-UtcDateTime (Get-Prop $cur.Data 'properties.keyVault.lastStatus.timeStampUtc')
+            $prevThumb = Get-Prop $cur.Data 'properties.thumbprint'
+            $r = Invoke-Arm -Method post -Url "$objUrl/refreshSecret"
             if (-not $r.Ok) { $res.status = 'failed'; $res.reason = $r.Error; Write-Host "   FAILED ($($r.Error))" -ForegroundColor Red; break }
-            $final = Wait-NamedValue -Url $nvUrl -Done { param($d) (Get-Prop $d 'properties.keyVault.lastStatus.timeStampUtc') -ne $prevTs }
+            [void](Wait-ArmAsync $r)
+            $final = Wait-NamedValue -Url $objUrl -Done { param($d) (ConvertTo-UtcDateTime (Get-Prop $d 'properties.keyVault.lastStatus.timeStampUtc')) -ne $prevTs }
             $code = Get-Prop $final 'properties.keyVault.lastStatus.code'
-            $res.status = if ($final -and $code -eq 'Success') { 'refreshed' } else { 'failed' }
-            $res.verified = ($res.status -eq 'refreshed')
-            $res.reason = if ($res.status -eq 'refreshed') { 'Refreshed from Key Vault. This only reloads the current Key Vault value: confirm it is a NEW secret and revoke the old one at its issuer.' } else { "refresh did not complete (lastStatus: $code)" }
-            Write-Host "   $($res.status)" -ForegroundColor $(if ($res.status -eq 'refreshed') { 'Green' } else { 'Red' })
+            $newTs = ConvertTo-UtcDateTime (Get-Prop $final 'properties.keyVault.lastStatus.timeStampUtc')
+            if (-not ($final -and $code -eq 'Success')) {
+                $res.status = 'failed'; $res.reason = "refresh did not complete (lastStatus: $code)"
+                Write-Host "   $($res.status): $($res.reason)" -ForegroundColor Red; break
+            }
+            $res.status = 'refreshed'
+
+            # Evidence: APIM loaded AFTER the latest version was created, that version is still the latest,
+            # and (certificates) the thumbprint changed.
+            $meta2 = if ($vaultRid -and $ref.objectType -eq 'secrets') { Get-KeyVaultSecretMeta -VaultResourceId $vaultRid -Name $ref.name } else { $null }
+            $problems = @()
+            if (-not $CutoffUtc) { $problems += 'no -CompromisedSince: Key Vault version age not checked' }
+            if (-not ($meta -and $meta.Ok -and $meta2 -and $meta2.Ok)) { $problems += 'Key Vault metadata unavailable' }
+            else {
+                if ($meta2.Meta.latestVersion -ne $meta.Meta.latestVersion) { $problems += 'a newer Key Vault version appeared during refresh; refresh again' }
+                if (-not $newTs -or $newTs -le $meta.Meta.latestVersionCreatedUtc) { $problems += 'refresh timestamp is not later than the Key Vault version' }
+            }
+            $newThumb = Get-Prop $final 'properties.thumbprint'
+            if ($isCert) {
+                $res.thumbprintChanged = [bool]($newThumb -and $newThumb -ne $prevThumb)
+                if (-not $res.thumbprintChanged) { $problems += 'certificate thumbprint did not change' }
+            }
+            $res.verified = $problems.Count -eq 0
+            $res.reason = if ($res.verified) {
+                "Refreshed: APIM loaded Key Vault version $($meta2.Meta.latestVersion) created after the cutoff.$(if ($isCert) { ' Confirm it uses a NEW key pair and revoke the old certificate.' } else { ' Revoke the old value at its issuer.' })"
+            }
+            else { 'Refreshed but NOT verified: ' + ($problems -join '; ') + '.' }
+            Write-Host "   refreshed (verified: $($res.verified))" -ForegroundColor $(if ($res.verified) { 'Green' } else { 'Yellow' })
         }
 
         'named-value-secret' {
@@ -303,7 +368,7 @@ $unremediated = [System.Collections.Generic.List[object]]::new()
 foreach ($it in $allItems) {
     $r = $results | Where-Object { $_.instance -eq $it.instance -and $_.type -eq $it.type -and $_.id -eq $it.id } | Select-Object -First 1
     $partialKeys = $r -and $r.status -eq 'rotated' -and $it.type -in 'subscription-key', 'tenant-access', 'gateway-key' -and $keysToRotate.Count -lt 2
-    $unverified = $r -and $Apply -and $Verify -and $r.status -in $doneStatuses -and $r.verified -ne $true
+    $unverified = $r -and $r.status -in $doneStatuses -and ($r.verified -eq $false -or ($Apply -and $Verify -and $r.verified -ne $true))
     if ($it.type -eq 'policy-review') { continue }
     if (-not $r -or $r.status -notin $doneStatuses -or $partialKeys -or $unverified) {
         $why = if (-not $r) { if ($it.action -eq 'manual') { 'manual rotation required' } else { 'not selected' } }
@@ -322,12 +387,14 @@ $report = [ordered]@{
         inventoryCoverageComplete = [bool]$inventory.summary.coverageComplete
         signedInAs = $account.user.name; mode = $mode; keys = $keysToRotate; includeMaster = [bool]$IncludeMaster
         applied = [bool]$Apply; verify = [bool]$Verify; secretValuesWritten = $false
+        compromisedSinceUtc = $(if ($CutoffUtc) { $CutoffUtc.ToString('o') } else { $null })
     }
     summary      = [ordered]@{
         selected                 = $selected.Count
         rotated                  = @($results | Where-Object status -In $doneStatuses).Count
         wouldRotate              = @($results | Where-Object status -Like 'would-*').Count
         skipped                  = @($results | Where-Object status -EQ 'skipped').Count
+        blocked                  = @($results | Where-Object status -EQ 'blocked').Count
         partiallyRotated         = @($results | Where-Object status -EQ 'partially-rotated').Count
         failed                   = @($results | Where-Object status -EQ 'failed').Count
         verificationFailed       = @($results | Where-Object verified -EQ $false).Count
@@ -340,6 +407,7 @@ $report = [ordered]@{
     nextSteps    = @(
         'Distribute the new subscription keys to legitimate callers and test your APIs.'
         'Revoke the OLD credentials at each issuer (Key Vault secret versions, backends, IdP app secrets, Event Hubs/Redis keys). Updating APIM does not revoke them.'
+        'Key Vault exposure: rotate every keyvault-secret / keyvault-key item at its issuer, store the new value as a NEW version, re-run discovery with the same -CompromisedSince, then refresh the "blocked" Key Vault references. Disable the old versions afterwards.'
         'Rotate the manual items listed in "unremediated" following the note on each item.'
         'Re-run Get-ApimCredentials.ps1 and review subscriptions, users, policies and backends you did not create.'
     )
@@ -359,4 +427,4 @@ Write-Host ''
 $feedback | Format-Table instance, type, id, changed, keysChanged, verified -AutoSize | Out-String -Width 200 | Write-Host
 Write-Host ("Feedback written to {0}: {1} changed, {2} not changed (no secret values included)." -f $FeedbackFile,
     @($feedback | Where-Object changed -EQ 'Yes').Count, @($feedback | Where-Object changed -NE 'Yes').Count) -ForegroundColor Green
-if ($report.summary.failed -gt 0 -or $report.summary.partiallyRotated -gt 0 -or $report.summary.verificationFailed -gt 0) { exit 1 }
+if ($report.summary.failed -gt 0 -or $report.summary.partiallyRotated -gt 0 -or $report.summary.verificationFailed -gt 0 -or ($Apply -and $report.summary.blocked -gt 0)) { exit 1 }

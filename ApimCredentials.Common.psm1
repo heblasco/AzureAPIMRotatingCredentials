@@ -10,6 +10,9 @@
 Set-StrictMode -Version Latest
 
 $script:ApiVersion = '2024-05-01'
+# Key Vault is read through the ARM control plane only (metadata, never values), so it works with
+# vaults whose data plane is private. It needs its own API version.
+$script:KeyVaultApiVersion = '2024-11-01'
 $script:ArmResource = 'https://management.azure.com/'
 $script:Token = $null
 $script:TokenExpiresUtc = [datetime]::MinValue
@@ -208,6 +211,113 @@ function Get-StringSha256 {
     try { [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value))) } finally { $sha.Dispose() }
 }
 
+# ---------------------------------------------------------------- Key Vault (ARM control plane, metadata only)
+
+# Splits https://<vault>.vault.azure.net/<secrets|keys|certificates>/<name>[/<version>].
+function ConvertFrom-KeyVaultUri {
+    param([string]$Uri)
+    $u = $null
+    if (-not [Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref]$u)) { return $null }
+    $seg = @($u.AbsolutePath.Trim('/') -split '/' | Where-Object { $_ })
+    if ($seg.Count -lt 2 -or $seg[0] -notin 'secrets', 'keys', 'certificates') { return $null }
+    [pscustomobject][ordered]@{
+        vaultName  = ($u.Host -split '\.')[0].ToLowerInvariant()
+        objectType = $seg[0]
+        name       = $seg[1]
+        version    = if ($seg.Count -ge 3) { $seg[2] } else { $null }
+    }
+}
+
+function ConvertFrom-UnixTime {
+    param($Seconds)
+    if ($null -eq $Seconds -or "$Seconds" -notmatch '^\d+$') { return $null }
+    [DateTimeOffset]::FromUnixTimeSeconds([long]$Seconds).UtcDateTime
+}
+
+# ConvertFrom-Json may already return [datetime] (Utc/Unspecified for 'Z' strings) or a string.
+function ConvertTo-UtcDateTime {
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $(if ($Value.Kind -eq 'Local') { $Value.ToUniversalTime() } else { [datetime]::SpecifyKind($Value, 'Utc') }) }
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+    $d = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)) { return $d.UtcDateTime }
+    return $null
+}
+
+# Accepts only timestamps with an explicit offset or 'Z' so the cutoff is never interpreted in local time.
+function ConvertTo-CutoffUtc {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    if ($Value -notmatch '(Z|[+-]\d{2}:?\d{2})$') { throw "-CompromisedSince must include a UTC offset, e.g. 2026-11-20T00:00:00Z (got '$Value')." }
+    $d = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$d)) { throw "Invalid -CompromisedSince '$Value'." }
+    if ($d -gt [DateTimeOffset]::UtcNow.AddMinutes(5)) { throw '-CompromisedSince is in the future.' }
+    $d.UtcDateTime
+}
+
+# vaultName (lower case) -> ARM resource ID, for every vault visible in the given subscriptions.
+function Get-KeyVaultIndex {
+    param([string[]]$SubscriptionIds)
+    $subs = @($SubscriptionIds | Where-Object { $_ } | Sort-Object -Unique)
+    $res = Get-ArmCollections -Urls @($subs | ForEach-Object { "https://management.azure.com/subscriptions/$_/providers/Microsoft.KeyVault/vaults?api-version=$script:KeyVaultApiVersion" })
+    $index = @{}; $errors = @()
+    for ($i = 0; $i -lt $subs.Count; $i++) {
+        if (-not $res[$i].Ok) { $errors += [pscustomobject]@{ subscriptionId = $subs[$i]; error = $res[$i].Error }; continue }
+        foreach ($v in $res[$i].Items) { $index[$v.name.ToLowerInvariant()] = $v.id }
+    }
+    [pscustomobject]@{ Index = $index; Errors = $errors }
+}
+
+# Projects an ARM secret/key resource to non-secret metadata. ARM never returns values.
+function ConvertTo-KeyVaultObjectMeta {
+    param($Resource, [ValidateSet('secrets', 'keys')][string]$ObjectType)
+    $p = $Resource.properties
+    $uriWithVersion = if ($ObjectType -eq 'secrets') { $p.PSObject.Properties['secretUriWithVersion']?.Value } else { $p.PSObject.Properties['keyUriWithVersion']?.Value }
+    $a = $p.PSObject.Properties['attributes']?.Value
+    [pscustomobject][ordered]@{
+        name                    = $Resource.name
+        objectType              = $ObjectType
+        latestVersion           = if ($uriWithVersion) { ($uriWithVersion -split '/')[-1] } else { $null }
+        latestVersionCreatedUtc = ConvertFrom-UnixTime (${a}?.PSObject.Properties['created']?.Value)
+        updatedUtc              = ConvertFrom-UnixTime (${a}?.PSObject.Properties['updated']?.Value)
+        expiresUtc              = ConvertFrom-UnixTime (${a}?.PSObject.Properties['exp']?.Value)
+        enabled                 = ${a}?.PSObject.Properties['enabled']?.Value
+        contentType             = $p.PSObject.Properties['contentType']?.Value
+        keyType                 = $p.PSObject.Properties['kty']?.Value
+    }
+}
+
+# Lists secrets or keys of a vault. Returns @{ Ok; Items (metadata); Error }.
+function Get-KeyVaultObjects {
+    param([string]$VaultResourceId, [ValidateSet('secrets', 'keys')][string]$ObjectType)
+    $r = Get-ArmCollection -Url "https://management.azure.com$VaultResourceId/$ObjectType`?api-version=$script:KeyVaultApiVersion"
+    [pscustomobject]@{ Ok = $r.Ok; Error = $r.Error; Items = @($r.Items | ForEach-Object { ConvertTo-KeyVaultObjectMeta $_ $ObjectType }) }
+}
+
+# Current (latest) version metadata of one secret. Returns $null with -ErrorText when unavailable.
+function Get-KeyVaultSecretMeta {
+    param([string]$VaultResourceId, [string]$Name)
+    $r = Invoke-Arm -Url "https://management.azure.com$VaultResourceId/secrets/$Name`?api-version=$script:KeyVaultApiVersion"
+    if (-not $r.Ok) { return [pscustomobject]@{ Ok = $false; NotFound = $r.NotFound; Error = $r.Error; Meta = $null } }
+    [pscustomobject]@{ Ok = $true; NotFound = $false; Error = $null; Meta = (ConvertTo-KeyVaultObjectMeta $r.Data 'secrets') }
+}
+
+# Assessment of a Key Vault reference against the latest version and the optional compromise cutoff.
+# Values: secret-not-found | metadata-unavailable | pinned-to-older-version | not-rotated-in-key-vault |
+#         new-version-available | rotation-required (no cutoff given) | unknown
+function Get-KeyVaultAssessment {
+    param($Ref, $MetaResult, [Nullable[datetime]]$CutoffUtc)
+    if (-not $MetaResult) { return 'metadata-unavailable' }
+    if (-not $MetaResult.Ok) { return $(if ($MetaResult.NotFound) { 'secret-not-found' } else { 'metadata-unavailable' }) }
+    $m = $MetaResult.Meta
+    if ($Ref.version -and $m.latestVersion -and $Ref.version -ne $m.latestVersion) { return 'pinned-to-older-version' }
+    if (-not $CutoffUtc) { return 'rotation-required' }
+    if (-not $m.latestVersionCreatedUtc -or $m.latestVersionCreatedUtc -gt [datetime]::UtcNow.AddMinutes(5)) { return 'unknown' }
+    if ($m.latestVersionCreatedUtc -gt $CutoffUtc) { return 'new-version-available' }
+    return 'not-rotated-in-key-vault'
+}
+
 # One row per inventory item stating whether it was changed. Never contains secret values.
 function Get-RotationFeedback {
     param([object[]]$Items, [object[]]$Results, [object[]]$Unremediated, [bool]$Applied, [bool]$Verify)
@@ -222,7 +332,7 @@ function Get-RotationFeedback {
             elseif (-not $Applied) { 'No (dry-run)' }
             elseif (-not $r) { 'No' }
             elseif ($r.status -eq 'partially-rotated' -or ($r.status -in $done -and $isKeyed -and $keysChanged.Count -lt 2)) { 'Partial' }
-            elseif ($r.status -in $done -and $Verify -and $r.verified -ne $true) { 'Unverified' }
+            elseif ($r.status -in $done -and ($r.verified -eq $false -or ($Verify -and $r.verified -ne $true))) { 'Unverified' }
             elseif ($r.status -in $done) { 'Yes' }
             else { 'No' }
         $detail =
@@ -245,4 +355,6 @@ function Get-RotationFeedback {
 }
 
 Export-ModuleMember -Function Initialize-AzCli, Invoke-AzCli, Invoke-Arm, Get-ArmCollection, Get-ApimBaseUrl,
-    Add-ApiVersion, Invoke-ArmParallel, Get-ArmCollections, Get-StringSha256, Get-RotationFeedback -Variable ApiVersion
+    Add-ApiVersion, Invoke-ArmParallel, Get-ArmCollections, Get-StringSha256, Get-RotationFeedback,
+    ConvertFrom-KeyVaultUri, ConvertFrom-UnixTime, ConvertTo-UtcDateTime, ConvertTo-CutoffUtc, Get-KeyVaultIndex, Get-KeyVaultObjects,
+    Get-KeyVaultSecretMeta, Get-KeyVaultAssessment -Variable ApiVersion, KeyVaultApiVersion

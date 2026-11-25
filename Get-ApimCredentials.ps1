@@ -21,6 +21,9 @@
     ./Get-ApimCredentials.ps1 -SubscriptionId <id>            # every APIM in the subscription
 .EXAMPLE
     ./Get-ApimCredentials.ps1 -AllSubscriptions -OutFile all.json
+.EXAMPLE
+    # Key Vault exposure: list every Key Vault-linked credential and the contents of the affected vaults
+    ./Get-ApimCredentials.ps1 -ResourceGroup my-rg -Name my-apim -KeyVault my-kv -CompromisedSince 2026-11-20T00:00:00Z
 #>
 [CmdletBinding(DefaultParameterSetName = 'Scoped')]
 param(
@@ -30,12 +33,20 @@ param(
     [Parameter(ParameterSetName = 'All')][switch]$AllSubscriptions,
     [string]$OutFile = 'apim-credentials-inventory.json',
     [switch]$SkipOperationPolicies,
+    # Key Vaults to treat as exposed, by name or ARM resource ID. Vaults referenced by APIM are always included.
+    [string[]]$KeyVault,
+    # Do not list the contents of the affected vaults (only the referenced secrets are checked). Coverage becomes incomplete.
+    [switch]$SkipKeyVaultContents,
+    # Start of the exposure window, with an explicit offset (e.g. 2026-11-20T00:00:00Z). Used only to tell
+    # whether each Key Vault secret has a version created afterwards; it never clears rotationRequired.
+    [string]$CompromisedSince,
     # Maximum concurrent read-only ARM requests. Lower it if you hit ARM throttling (HTTP 429).
     [ValidateRange(1, 64)][int]$ThrottleLimit = 16
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'ApimCredentials.Common.psm1') -Force
+$CutoffUtc = ConvertTo-CutoffUtc $CompromisedSince
 
 $NotSupportedRx = 'Bad ?Request|Method ?Not ?Allowed|NotSupported'
 $SecretNameRx = '(?i)(pass(word|wd)?|pwd|secret|token|api[-_]?key|subscription[-_]?key|ocp-apim|connection[-_ ]?string|accountkey|sharedaccess|sas|credential|private[-_]?key|client[-_]?secret|authorization|auth|bearer|signature|\bkey\b|[-_]key$)'
@@ -135,6 +146,20 @@ function Get-PolicyFindings {
     return $result
 }
 
+# Names inside {{...}} (named value references). Works on any string held in memory.
+function Get-NamedValueRefs {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    @([regex]::Matches($Text, '\{\{\s*([^{}]+?)\s*\}\}') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+}
+
+# certificate-id / thumbprint attributes of <authentication-certificate> in a policy (in memory only).
+function Get-PolicyCertificateRefs {
+    param([string]$Xml)
+    if ([string]::IsNullOrEmpty($Xml)) { return @() }
+    @([regex]::Matches($Xml, '<authentication-certificate\b[^>]*?\b(?:certificate-id|thumbprint)\s*=\s*"([^"{}@]+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+}
+
 function New-Item2 {
     param([hashtable]$Ctx, [string]$Type, [string]$Id, [string]$Action, [string]$Note, [hashtable]$Details)
     $o = [ordered]@{
@@ -170,6 +195,16 @@ function Invoke-InstanceDiscovery {
     $ctx = @{ subscriptionId = $Sub; resourceGroup = $Rg; instance = $Apim }
     $items = [System.Collections.Generic.List[object]]::new()
     $coverage = [System.Collections.Generic.List[object]]::new()
+    # Who uses what: lower-case named value name / certificate id or thumbprint -> consumers.
+    $nvRefs = @{}; $certRefs = @{}
+    $addRef = {
+        param([hashtable]$Map, [string[]]$Keys, [string]$Consumer)
+        foreach ($k in @($Keys | Where-Object { $_ })) {
+            $kk = $k.ToLowerInvariant()
+            if (-not $Map.ContainsKey($kk)) { $Map[$kk] = [System.Collections.Generic.List[string]]::new() }
+            if (-not $Map[$kk].Contains($Consumer)) { $Map[$kk].Add($Consumer) }
+        }
+    }
 
     # Prefetch every top-level collection and single resource concurrently; sections below read the cache.
     $topLevel = @('subscriptions', 'namedValues', 'backends', 'authorizationServers', 'openidConnectProviders', 'identityProviders',
@@ -251,6 +286,12 @@ function Invoke-InstanceDiscovery {
         $kinds += @($authKind, $proxyKind) | Where-Object { $_ }
         $hasLiteral = @($kinds | Where-Object { $_ -in 'literal', 'mixed-literal-and-ref' }).Count -gt 0
         $certs = @(@(Get-Prop $cred 'certificate') + @(Get-Prop $cred 'certificateIds') | Where-Object { $_ })
+        $sf = Get-Prop $be 'properties.properties.serviceFabricCluster'
+        $beConsumer = "backend:$($be.name)"
+        $nvTexts = @(foreach ($p in @((Get-Prop $cred 'header')?.PSObject.Properties) + @((Get-Prop $cred 'query')?.PSObject.Properties)) { if ($p) { @($p.Value) } }) + @((Get-Prop $auth 'parameter'), $proxyPwd)
+        & $addRef $nvRefs @($nvTexts | ForEach-Object { Get-NamedValueRefs ([string]$_) }) $beConsumer
+        & $addRef $certRefs @($certs | ForEach-Object { ([string]$_ -split '/')[-1] }) $beConsumer
+        if ($sf) { & $addRef $certRefs @(([string](Get-Prop $sf 'clientCertificateId') -split '/')[-1], (Get-Prop $sf 'clientCertificatethumbprint')) $beConsumer }
         if (-not $headers -and -not $queries -and -not $auth -and -not $certs -and -not $proxyUser -and -not $proxyPwd) { continue }
         $urlHost = $null
         $u = $null
@@ -285,29 +326,66 @@ function Invoke-InstanceDiscovery {
     foreach ($x in & $list 'loggers' 'loggers') {
         $c = Get-Prop $x 'properties.credentials'
         $credKeys = @(); $kinds = @()
-        if ($c) { foreach ($p in $c.PSObject.Properties) { $credKeys += $p.Name; $kinds += Get-ValueKind ([string]$p.Value) } }
+        if ($c) { foreach ($p in $c.PSObject.Properties) { $credKeys += $p.Name; $kinds += Get-ValueKind ([string]$p.Value); & $addRef $nvRefs @(Get-NamedValueRefs ([string]$p.Value)) "logger:$($x.name)" } }
         if (-not $credKeys) { continue }
         $items.Add((New-Item2 $ctx 'logger' $x.name 'manual' 'Rotate the connection string/key at the target (Event Hubs/App Insights). If the credential is a {{named value}}, rotate that named value; otherwise update logger with current ETag. Prefer managed identity.' @{
                     loggerType = Get-Prop $x 'properties.loggerType'; credentialKeys = $credKeys; valueKinds = $kinds; resourceId = Get-Prop $x 'properties.resourceId' }))
     }
     foreach ($x in & $list 'caches' 'caches' -OptionalFeature) {
+        & $addRef $nvRefs @(Get-NamedValueRefs ([string](Get-Prop $x 'properties.connectionString'))) "cache:$($x.name)"
         $items.Add((New-Item2 $ctx 'external-cache' $x.name 'manual' 'Regenerate the Redis access key, update the cache connection string, then revoke the old key.' @{
                     description = Get-Prop $x 'properties.description'; useFromLocation = Get-Prop $x 'properties.useFromLocation'
                     connectionStringKind = Get-ValueKind (Get-Prop $x 'properties.connectionString') }))
     }
 
-    # 6. Certificates (client certificates for backends)
+    # 6. Certificates (client certificates for backends / policies)
     foreach ($x in & $list 'certificates' 'certificates') {
-        $items.Add((New-Item2 $ctx 'certificate' $x.name 'manual' 'Issue a new certificate (prefer Key Vault reference), update backends/policies to use it, then revoke the old one.' @{
-                    subject = Get-Prop $x 'properties.subject'; thumbprint = Get-Prop $x 'properties.thumbprint'; expirationDate = Get-Prop $x 'properties.expirationDate'
-                    keyVaultBacked = [bool](Get-Prop $x 'properties.keyVault.secretIdentifier') }))
+        $kvId = Get-Prop $x 'properties.keyVault.secretIdentifier'
+        $common = @{ subject = Get-Prop $x 'properties.subject'; thumbprint = Get-Prop $x 'properties.thumbprint'; expirationDate = Get-Prop $x 'properties.expirationDate' }
+        if ($kvId) {
+            $common += @{
+                keyVaultSecretId = $kvId; versionPinned = [bool]((ConvertFrom-KeyVaultUri $kvId)?.version)
+                keyVaultIdentity = Get-Prop $x 'properties.keyVault.identityClientId'
+                lastRefreshStatus = Get-Prop $x 'properties.keyVault.lastStatus.code'
+                lastRefreshUtc = Get-Prop $x 'properties.keyVault.lastStatus.timeStampUtc'
+                issuerRevocationRequired = $true
+            }
+            $items.Add((New-Item2 $ctx 'certificate-kv' $x.name 'auto' 'Key Vault-backed certificate. Reissue it in Key Vault with a NEW key pair (a renewal may reuse the exposed key), then refreshSecret. Revoke the old certificate.' $common))
+        }
+        else {
+            $items.Add((New-Item2 $ctx 'certificate' $x.name 'manual' 'Issue a new certificate (prefer Key Vault reference), update backends/policies to use it, then revoke the old one.' ($common + @{ keyVaultBacked = $false })))
+        }
     }
 
-    # 7. Self-hosted gateway keys
-    foreach ($gw in & $list 'gateways' 'gateways' -OptionalFeature) {
-        if ($gw.name -eq 'managed') { continue }
+    # 6b. Custom domain certificates loaded from Key Vault (service hostnameConfigurations).
+    if ($svc.Ok) {
+        $hcs = @(Get-Prop $svc.Data 'properties.hostnameConfigurations' | Where-Object { $_ })
+        $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'hostnameConfigurations'; status = 'ok'; count = $hcs.Count; error = $null })
+        foreach ($h in $hcs) {
+            $kvId = Get-Prop $h 'keyVaultId'
+            if (-not $kvId) { continue }
+            $items.Add((New-Item2 $ctx 'hostname-certificate-kv' "$(Get-Prop $h 'type'):$(Get-Prop $h 'hostName')" 'manual' 'Custom domain certificate from Key Vault. Reissue it with a NEW key pair in Key Vault; APIM auto-syncs unversioned references (can take 1-2 days, no SLA on Developer tier). Use the portal certificate sync or re-apply the hostname configuration, then check the certificate served on the endpoint. Revoke the old certificate.' @{
+                        hostnameType = Get-Prop $h 'type'; hostName = Get-Prop $h 'hostName'; keyVaultSecretId = $kvId
+                        versionPinned = [bool]((ConvertFrom-KeyVaultUri $kvId)?.version); keyVaultIdentity = Get-Prop $h 'identityClientId'
+                        thumbprint = Get-Prop $h 'certificate.thumbprint'; expirationDate = Get-Prop $h 'certificate.expiry'
+                        issuerRevocationRequired = $true
+                    }))
+        }
+    }
+
+    # 7. Self-hosted gateway keys (and which certificates their hostname configurations use)
+    $shg = @(& $list 'gateways' 'gateways' -OptionalFeature | Where-Object { $_.name -ne 'managed' })
+    foreach ($gw in $shg) {
         $items.Add((New-Item2 $ctx 'gateway-key' $gw.name 'auto' 'Self-hosted gateway keys. Regenerating invalidates tokens derived from that key: issue a new gateway token and redeploy the gateway.' @{
                     description = Get-Prop $gw 'properties.description' }))
+    }
+    if ($shg.Count -gt 0) {
+        $gwHc = Get-ArmCollections -Urls @($shg | ForEach-Object { "$base/gateways/$($_.name)/hostnameConfigurations" }) -ThrottleLimit $ThrottleLimit
+        for ($i = 0; $i -lt $shg.Count; $i++) {
+            foreach ($hc in & $list "gateways/$($shg[$i].name)/hostnameConfigurations" '' -Result $gwHc[$i]) {
+                & $addRef $certRefs @(([string](Get-Prop $hc 'properties.certificateId') -split '/')[-1]) "gateway:$($shg[$i].name)/$($hc.name)"
+            }
+        }
     }
 
     # 8. Direct management API (tenant access) keys
@@ -355,6 +433,8 @@ function Invoke-InstanceDiscovery {
             $xml = Get-Prop $pol 'properties.value'
             if (-not $xml) { continue }
             $policiesScanned++
+            & $addRef $nvRefs @(Get-NamedValueRefs $xml) "policy:$($t.id)"
+            & $addRef $certRefs @(Get-PolicyCertificateRefs $xml) "policy:$($t.id)"
             $f = Get-PolicyFindings $xml
             if ($f.findings.Count -gt 0 -or -not $f.parsed) {
                 $items.Add((New-Item2 $ctx 'policy' $t.id 'manual' 'Possible hard-coded credential. Review the listed lines in the portal policy editor, rotate at the source and replace with a Key Vault-backed {{named value}}.' @{
@@ -378,6 +458,8 @@ function Invoke-InstanceDiscovery {
             }
         }
         $policiesScanned++
+        & $addRef $nvRefs @(Get-NamedValueRefs $xml) "policy:fragment:$($frag.name)"
+        & $addRef $certRefs @(Get-PolicyCertificateRefs $xml) "policy:fragment:$($frag.name)"
         $f = Get-PolicyFindings $xml
         if ($f.findings.Count -gt 0 -or -not $f.parsed) {
             $items.Add((New-Item2 $ctx 'policy' "fragment:$($frag.name)" 'manual' 'Possible hard-coded credential in policy fragment. Review in the portal, rotate at source, use a Key Vault-backed {{named value}}.' @{
@@ -399,6 +481,18 @@ function Invoke-InstanceDiscovery {
     elseif (-not $ws.Ok -and -not ($ws.NotFound -or $ws.Error -match $NotSupportedRx)) {
         $coverage.Add([pscustomobject][ordered]@{ instance = $Apim; collection = 'workspaces'; status = 'failed'; count = 0; error = $ws.Error })
         Write-Warning "[$Apim] could not enumerate workspaces ($($ws.Error))"
+    }
+
+    # Attach consumers (impact map) to named values and certificates.
+    foreach ($it in $items) {
+        $keys = switch -Wildcard ($it.type) {
+            'named-value*' { @($it.id, $it.displayName) }
+            'certificate*' { @($it.id, $it.thumbprint) }
+            default { $null }
+        }
+        if ($null -eq $keys) { continue }
+        $used = @($keys | Where-Object { $_ } | ForEach-Object { $k = $_.ToLowerInvariant(); $m = if ($it.type -like 'named-value*') { $nvRefs } else { $certRefs }; if ($m.ContainsKey($k)) { $m[$k] } } | Sort-Object -Unique)
+        $it | Add-Member -NotePropertyName usedBy -NotePropertyValue $used -Force
     }
 
     return @{ instance = [pscustomobject]$instanceInfo; items = $items; coverage = $coverage }
@@ -447,7 +541,97 @@ foreach ($t in $targets) {
     foreach ($c in $res.coverage) { $allCoverage.Add($c) }
 }
 
-$failed = @($allCoverage | Where-Object status -In 'failed', 'not-scanned', 'skipped')
+# ---------------------------------------------------------------- Key Vault exposure
+# Every APIM item that loads a credential from Key Vault, plus the full contents (metadata only) of the
+# affected vaults: vaults referenced by APIM and vaults passed with -KeyVault.
+$kvLinked = @($allItems | Where-Object { $_.PSObject.Properties['keyVaultSecretId'] -and $_.keyVaultSecretId })
+$vaults = [ordered]@{}   # name -> @{ resourceId; explicit }
+foreach ($it in $kvLinked) { $ref = ConvertFrom-KeyVaultUri $it.keyVaultSecretId; if ($ref -and -not $vaults.Contains($ref.vaultName)) { $vaults[$ref.vaultName] = @{ resourceId = $null; explicit = $false } } }
+foreach ($kvArg in @($KeyVault | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+    $isId = $kvArg -match '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.KeyVault/vaults/[^/]+$'
+    $n = ($kvArg -split '/')[-1].ToLowerInvariant()
+    $vaults[$n] = @{ resourceId = $(if ($isId) { $kvArg } else { $null }); explicit = $true }
+}
+$keyVaultInfo = @()
+if ($vaults.Count -gt 0) {
+    Write-Host ">> Key Vault exposure: $($vaults.Keys -join ', ')" -ForegroundColor Cyan
+    $kvIdx = Get-KeyVaultIndex -SubscriptionIds $subIds
+    foreach ($e in $kvIdx.Errors) { $allCoverage.Add([pscustomobject][ordered]@{ instance = $null; collection = "keyvault-list:$($e.subscriptionId)"; status = 'failed'; count = 0; error = $e.error }) }
+
+    $metaByVault = @{}   # vault -> @{ secrets = @{name -> meta}; listed = bool }
+    foreach ($vn in @($vaults.Keys)) {
+        $v = $vaults[$vn]
+        if (-not $v.resourceId) { $v.resourceId = $kvIdx.Index[$vn] }
+        $metaByVault[$vn] = @{ secrets = @{}; listed = $false }
+        if (-not $v.resourceId) {
+            $allCoverage.Add([pscustomobject][ordered]@{ instance = $vn; collection = "keyvault:$vn"; status = 'not-found'; count = 0; error = 'Vault not found in the scanned subscriptions (other subscription or no access). Pass its resource ID with -KeyVault.' })
+            Write-Warning "Key Vault '$vn' could not be resolved; its contents and versions are NOT checked."
+            $keyVaultInfo += [pscustomobject][ordered]@{ name = $vn; resourceId = $null; explicit = $v.explicit; contentsScanned = $false }
+            continue
+        }
+        $vSeg = $v.resourceId -split '/'
+        $vctx = @{ subscriptionId = $vSeg[2]; resourceGroup = $vSeg[4]; instance = $vn }
+        $consumersOf = {
+            param([string]$ObjName)
+            @($kvLinked | Where-Object { $r = ConvertFrom-KeyVaultUri $_.keyVaultSecretId; $r -and $r.vaultName -eq $vn -and $r.name -eq $ObjName } | ForEach-Object { "$($_.instance)/$($_.type)/$($_.id)" })
+        }
+        if ($SkipKeyVaultContents) {
+            $allCoverage.Add([pscustomobject][ordered]@{ instance = $vn; collection = "keyvault:$vn/contents"; status = 'skipped'; count = 0; error = 'Skipped by -SkipKeyVaultContents.' })
+        }
+        else {
+            foreach ($ot in 'secrets', 'keys') {
+                $lr = Get-KeyVaultObjects -VaultResourceId $v.resourceId -ObjectType $ot
+                $allCoverage.Add([pscustomobject][ordered]@{ instance = $vn; collection = "keyvault:$vn/$ot"; status = $(if ($lr.Ok) { 'ok' } else { 'failed' }); count = $lr.Items.Count; error = $lr.Error })
+                if (-not $lr.Ok) { Write-Warning "Could not list $ot of Key Vault '$vn' ($($lr.Error))"; continue }
+                if ($ot -eq 'secrets') { $metaByVault[$vn].listed = $true }
+                foreach ($m in $lr.Items) {
+                    if ($ot -eq 'secrets') { $metaByVault[$vn].secrets[$m.name.ToLowerInvariant()] = $m }
+                    $isCertLike = $ot -eq 'secrets' -and $m.contentType -match 'pkcs12|pem'
+                    $note = if ($ot -eq 'keys') { 'Exposed Key Vault key: create a new key version (rotate), re-wrap / re-encrypt / re-sign what depends on it, then disable the old versions.' }
+                    elseif ($isCertLike) { 'Exposed certificate / private key: reissue the certificate with a NEW key pair, store it as a new version, update consumers, then revoke the old certificate.' }
+                    else { 'Exposed Key Vault secret: issue a NEW credential at its issuer, store it as a new version, refresh consumers, then revoke the old credential at the issuer and disable old versions.' }
+                    $assess = Get-KeyVaultAssessment -Ref ([pscustomobject]@{ version = $null }) -MetaResult ([pscustomobject]@{ Ok = $true; NotFound = $false; Meta = $m }) -CutoffUtc $CutoffUtc
+                    $allItems.Add((New-Item2 $vctx $(if ($ot -eq 'keys') { 'keyvault-key' } else { 'keyvault-secret' }) $m.name 'manual' $note @{
+                                resourceKind = 'Microsoft.KeyVault/vaults'; exposure = 'key-vault'; rotationRequired = $true
+                                latestVersion = $m.latestVersion; latestVersionCreatedUtc = $m.latestVersionCreatedUtc; enabled = $m.enabled
+                                expiresUtc = $m.expiresUtc; contentType = $m.contentType; keyType = $m.keyType
+                                keyVaultAssessment = $assess; usedBy = @(& $consumersOf $m.name); issuerRevocationRequired = $true
+                            }))
+                }
+            }
+        }
+        $keyVaultInfo += [pscustomobject][ordered]@{ name = $vn; resourceId = $v.resourceId; explicit = $v.explicit; contentsScanned = [bool]$metaByVault[$vn].listed }
+    }
+
+    # Mark every APIM item that loads from Key Vault and assess its reference.
+    foreach ($it in $kvLinked) {
+        $ref = ConvertFrom-KeyVaultUri $it.keyVaultSecretId
+        $v = if ($ref) { $vaults[$ref.vaultName] } else { $null }
+        $mr = $null
+        if ($ref -and $v -and $v.resourceId -and $ref.objectType -eq 'secrets') {
+            $m = $metaByVault[$ref.vaultName].secrets[$ref.name.ToLowerInvariant()]
+            $mr = if ($m) { [pscustomobject]@{ Ok = $true; NotFound = $false; Meta = $m } }
+            else { Get-KeyVaultSecretMeta -VaultResourceId $v.resourceId -Name $ref.name }
+        }
+        $assess = Get-KeyVaultAssessment -Ref $ref -MetaResult $mr -CutoffUtc $CutoffUtc
+        $latest = if ($mr -and $mr.Ok) { $mr.Meta } else { $null }
+        $loaded = $null
+        if ($latest -and $latest.latestVersionCreatedUtc -and $it.PSObject.Properties['lastRefreshUtc'] -and $it.lastRefreshUtc) {
+            $lr = ConvertTo-UtcDateTime $it.lastRefreshUtc
+            $loaded = ($it.lastRefreshStatus -eq 'Success') -and $lr -and ($lr -gt $latest.latestVersionCreatedUtc) -and ($assess -ne 'pinned-to-older-version')
+        }
+        $it | Add-Member -Force -NotePropertyName exposure -NotePropertyValue 'key-vault'
+        $it | Add-Member -Force -NotePropertyName rotationRequired -NotePropertyValue $true
+        $it | Add-Member -Force -NotePropertyName keyVault -NotePropertyValue ([pscustomobject][ordered]@{
+                vaultName = ${ref}?.vaultName; vaultResourceId = ${v}?.resourceId; objectName = ${ref}?.name
+                configuredVersion = ${ref}?.version; latestVersion = ${latest}?.latestVersion; latestVersionCreatedUtc = ${latest}?.latestVersionCreatedUtc
+                assessment = $assess; apimLoadedLatestVersion = $loaded; metadataError = $(if ($mr -and -not $mr.Ok) { $mr.Error } else { $null })
+            })
+    }
+}
+
+$failed = @($allCoverage | Where-Object status -In 'failed', 'not-scanned', 'skipped', 'not-found')
+$kvPendingStates = 'rotation-required', 'not-rotated-in-key-vault', 'pinned-to-older-version', 'secret-not-found', 'metadata-unavailable', 'unknown'
 $inventory = [ordered]@{
     metadata = [ordered]@{
         generatedAtUtc   = (Get-Date).ToUniversalTime().ToString('o')
@@ -458,12 +642,17 @@ $inventory = [ordered]@{
         secretValuesRead = $false
         heuristicNote    = 'Named-value and policy credential detection is heuristic. Review policy-review items and coverage.'
         instances        = $instances
+        compromisedSinceUtc = $(if ($CutoffUtc) { $CutoffUtc.ToString('o') } else { $null })
+        keyVaults        = $keyVaultInfo
     }
     summary  = [ordered]@{
         coverageComplete = ($failed.Count -eq 0)
         totalItems       = $allItems.Count
         autoRotatable    = @($allItems | Where-Object action -EQ 'auto').Count
         manual           = @($allItems | Where-Object action -EQ 'manual').Count
+        keyVaultLinkedItems = $kvLinked.Count
+        keyVaultObjects  = @($allItems | Where-Object type -In 'keyvault-secret', 'keyvault-key').Count
+        keyVaultPendingInKeyVault = @($kvLinked | Where-Object { $_.keyVault.assessment -in $kvPendingStates }).Count
         byType           = [ordered]@{}
     }
     coverage = $allCoverage
@@ -482,9 +671,17 @@ $allItems | Select-Object instance, type, id, action, @{n = 'detail'; e = {
             'tenant-access' { "enabled=$($i.directManagementApiEnabled)" }
             'policy' { "lines " + (($i.findings | ForEach-Object { $_.line } | Sort-Object -Unique) -join ',') }
             'policy-review' { "keyword lines " + ($i.keywordLines -join ',') }
-            default { $i.displayName }
+            { $_ -in 'keyvault-secret', 'keyvault-key' } { "$($i.keyVaultAssessment); usedBy=$(@($i.usedBy).Count)" }
+            default {
+                if ($i.PSObject.Properties['keyVault'] -and $i.keyVault) { "KV $($i.keyVault.vaultName)/$($i.keyVault.objectName): $($i.keyVault.assessment)" }
+                elseif ($i.PSObject.Properties['subject']) { $i.subject }
+                else { $i.displayName }
+            }
         } } } | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 
 Write-Host ("Items: {0} (auto: {1}, manual: {2})" -f $inventory.summary.totalItems, $inventory.summary.autoRotatable, $inventory.summary.manual)
+if ($vaults.Count -gt 0) {
+    Write-Host ("Key Vault: {0} APIM item(s) linked, {1} vault object(s) to rotate, {2} linked item(s) still pending in Key Vault{3}" -f $inventory.summary.keyVaultLinkedItems, $inventory.summary.keyVaultObjects, $inventory.summary.keyVaultPendingInKeyVault, $(if (-not $CutoffUtc) { ' (no -CompromisedSince: versions cannot be judged)' } else { '' }))
+}
 if ($failed) { Write-Warning "Coverage INCOMPLETE: $($failed.Count) collection(s) failed. See 'coverage' in $OutFile." }
 Write-Host "Inventory written to $OutFile (no secret values included)." -ForegroundColor Green
