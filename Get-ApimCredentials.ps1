@@ -126,7 +126,9 @@ function Get-PolicyFindings {
         foreach ($at in $el.Attributes()) {
             $an = $at.Name.LocalName
             if ($an -in 'name', 'id', 'thumbprint', 'certificate-id', 'output-token-variable-name', 'header-name', 'query-parameter-name', 'variable-name', 'client-id', 'resource', 'username') { continue }
-            if ($an -match $SecretNameRx) {
+            # cache-*-value "key" is the cache entry name, not a credential.
+            $isCacheKey = $an -eq 'key' -and $local -match '^cache-(lookup|store|remove)-value$'
+            if (-not $isCacheKey -and $an -match $SecretNameRx) {
                 $kind = Get-ValueKind $at.Value
                 if ($kind -in 'literal', 'mixed-literal-and-ref') {
                     $findings.Add([ordered]@{ line = $line; element = $local; target = $an; rule = 'credential-attribute'; valueKind = $kind; severity = 'high' })
